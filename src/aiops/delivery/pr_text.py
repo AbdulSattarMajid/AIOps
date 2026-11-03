@@ -3,6 +3,8 @@ import re
 from pathlib import PurePosixPath
 from typing import Dict, Tuple
 
+from aiops.security.redaction import redact_text
+
 
 _MENTION = re.compile(r"@(?!@)(?=[A-Za-z0-9_])")
 _BACKTICK_RUN = re.compile(r"`+")
@@ -125,6 +127,8 @@ def render_pr(summary: Dict, incident: Dict,
         "Generated automatically by AIOps. Review carefully. "
         "This PR is never auto-merged.",
     ])
+    title, _ = redact_text(title)
+    body, _ = redact_text(body)
     return title, body
 
 

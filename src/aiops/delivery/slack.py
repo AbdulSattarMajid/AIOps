@@ -1,5 +1,7 @@
 import httpx
 
+from aiops.security.redaction import redact_text
+
 
 def build_slack_text(summary: dict, incident: dict, pr_url: str) -> str:
     verification = summary.get("verification") or {}
@@ -13,10 +15,11 @@ def build_slack_text(summary: dict, incident: dict, pr_url: str) -> str:
     )
     status = str(verification.get("status", "not run")).replace("@", "@\u200b")
     safe_url = str(pr_url).replace("@", "@\u200b")
-    return (
+    text, _ = redact_text(
         f"AIOps fix for {service} ({error_type}); "
         f"verification: {status}. {safe_url}"
     )
+    return text
 
 
 def post_slack(webhook_url: str, text: str, post=None) -> None:

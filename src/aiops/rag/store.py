@@ -3,6 +3,7 @@ from pathlib import Path
 import chromadb
 
 from aiops.rag.embedding import embed_text
+from aiops.security.redaction import redact_text
 
 DEFAULT_TENANT = "default"
 GENERIC = "*"  # a runbook for "*" applies to every service
@@ -75,8 +76,9 @@ class RunbookStore:
         total = self._collection.count()
         if total == 0:
             return []
+        query_text, _ = redact_text(error_signature)
         result = self._collection.query(
-            query_embeddings=[embed_text(error_signature)],  # service is handled by the filter below
+            query_embeddings=[embed_text(query_text)],  # service is handled by the filter below
             n_results=min(total, top_k * 3),
             where={"$or": [{"service_name": service_name}, {"service_name": GENERIC}]},
         )

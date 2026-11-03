@@ -10,6 +10,7 @@ from aiops.context.extract import extract_function, resolve_repo_path
 from aiops.context.stacktrace import parse_python_traceback
 from aiops.sandbox.evaluate import Verification, evaluate_verification
 from aiops.sandbox.runner import SandboxResult
+from aiops.security.redaction import redact_text, source_secret_findings
 
 
 class IncidentState(TypedDict, total=False):
@@ -47,7 +48,8 @@ class IncidentState(TypedDict, total=False):
 
 def build_graph(llm, store, sandbox=None):
     def analyze_error(state: IncidentState) -> Dict:
-        parsed = parse_python_traceback(state.get("trace", ""))
+        trace, _ = redact_text(state.get("trace", ""))
+        parsed = parse_python_traceback(trace)
         frame = parsed.crash_frame
         if frame is None:
             return {
@@ -92,6 +94,16 @@ def build_graph(llm, store, sandbox=None):
             source_lines[frame.line - 1]
             if 1 <= frame.line <= len(source_lines) else ""
         )
+        if source_secret_findings(context.source):
+            return {
+                "signature": parsed.signature,
+                "rel_path": rel_path,
+                "function_name": context.function,
+                "function_range": (context.start_line, context.end_line),
+                "status": "escalated",
+                "reason": "secret found in source code",
+                "trace": trace,
+            }
         return {
             "signature": parsed.signature,
             "rel_path": rel_path,
@@ -102,6 +114,7 @@ def build_graph(llm, store, sandbox=None):
             "file_source": file_source,
             "status": "running",
             "reason": "",
+            "trace": trace,
         }
 
     def retrieve_runbook(state: IncidentState) -> Dict:
@@ -112,7 +125,12 @@ def build_graph(llm, store, sandbox=None):
             state.get("signature", ""),
             top_k=2,
         )
-        return {"runbooks": runbooks}
+        cleaned = []
+        for runbook in runbooks:
+            item = dict(runbook)
+            item["text"], _ = redact_text(item.get("text", ""))
+            cleaned.append(item)
+        return {"runbooks": cleaned}
 
     def baseline_tests(state: IncidentState) -> Dict:
         try:
@@ -275,7 +293,7 @@ def build_graph(llm, store, sandbox=None):
             "verification": verification,
             "history": history,
             "last_error": error,
-            "last_test_output": after.output[-3000:],
+            "last_test_output": redact_text(after.output[-3000:])[0],
         }
         if state.get("attempt", 0) >= state.get("max_retries", 3):
             updated.update({
@@ -367,10 +385,11 @@ def run_agent(llm, store, trace: str, service_name: str,
               path_prefix: str = "/app/", max_retries: int = 3,
               sandbox=None) -> Dict:
     graph = build_graph(llm, store, sandbox=sandbox)
+    clean_trace, _ = redact_text(trace or "")
     initial: IncidentState = {
         "incident_id": incident_id,
         "service_name": service_name,
-        "trace": trace,
+        "trace": clean_trace,
         "repo_root": repo_root,
         "path_prefix": path_prefix,
         "max_retries": max_retries,
