@@ -18,7 +18,7 @@ report("Python 3.10+", sys.version_info >= (3, 10), "Install Python 3.11 or 3.12
 report("git installed", shutil.which("git") is not None, "Install git from git-scm.com")
 
 for module in ["fastapi", "uvicorn", "pydantic", "numpy", "chromadb",
-               "langgraph", "anthropic", "docker", "dotenv", "pytest"]:
+               "langgraph", "groq", "docker", "dotenv", "pytest"]:
     try:
         importlib.import_module(module)
         report("package: " + module, True)
@@ -37,8 +37,8 @@ try:
     load_dotenv()
 except Exception:
     pass
-report("ANTHROPIC_API_KEY set in .env", bool(os.getenv("ANTHROPIC_API_KEY")),
-       "Copy .env.example to .env and add your key")
+report("GROQ_API_KEY set in .env", bool(os.getenv("GROQ_API_KEY")),
+       "Copy .env.example to .env and add your Groq API key")
 
 print()
 print("Everything is ready." if ok else "Fix the [FAIL] items above, then run this again.")

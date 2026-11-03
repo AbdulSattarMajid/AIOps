@@ -28,7 +28,7 @@ pydantic>=2.6
 numpy>=1.26
 chromadb>=0.5
 langgraph>=0.2
-anthropic>=0.30
+groq>=0.9
 docker>=7.0
 python-dotenv>=1.0
 httpx>=0.27
@@ -50,12 +50,9 @@ chroma_data/
 .vscode/
 """
 
-FILES[".env.example"] = """# Copy this file to .env and fill in real values. NEVER commit .env.
-ANTHROPIC_API_KEY=
-GITHUB_TOKEN=
-GITHUB_REPO=owner/repo
-SLACK_WEBHOOK_URL=
-MAX_RETRIES=3
+FILES[".env.example"] = """GROQ_API_KEY=
+LLM_MODEL=openai/gpt-oss-20b
+LLM_FALLBACK_MODEL=openai/gpt-oss-120b
 """
 
 FILES["pytest.ini"] = """[pytest]
@@ -123,7 +120,7 @@ report("Python 3.10+", sys.version_info >= (3, 10), "Install Python 3.11 or 3.12
 report("git installed", shutil.which("git") is not None, "Install git from git-scm.com")
 
 for module in ["fastapi", "uvicorn", "pydantic", "numpy", "chromadb",
-               "langgraph", "anthropic", "docker", "dotenv", "pytest"]:
+               "langgraph", "groq", "docker", "dotenv", "pytest"]:
     try:
         importlib.import_module(module)
         report("package: " + module, True)
@@ -142,8 +139,8 @@ try:
     load_dotenv()
 except Exception:
     pass
-report("ANTHROPIC_API_KEY set in .env", bool(os.getenv("ANTHROPIC_API_KEY")),
-       "Copy .env.example to .env and add your key")
+report("GROQ_API_KEY set in .env", bool(os.getenv("GROQ_API_KEY")),
+       "Copy .env.example to .env and add your Groq API key")
 
 print()
 print("Everything is ready." if ok else "Fix the [FAIL] items above, then run this again.")

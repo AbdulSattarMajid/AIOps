@@ -3,7 +3,7 @@
 """
 import random
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 
@@ -11,7 +11,7 @@ URL = "http://127.0.0.1:8000/api/v1/telemetry/logs"
 
 
 def now():
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def null_reference():
@@ -22,7 +22,7 @@ def null_reference():
         "message": "'NoneType' object has no attribute 'email'",
         "stack_trace": (
             "Traceback (most recent call last):\n"
-            f'  File "/app/users.py", line {random.randint(40, 45)}, in get_user_email\n'
+            '  File "/app/users.py", line 19, in get_user_email\n'
             "    return user.email\n"
             "AttributeError: 'NoneType' object has no attribute 'email'\n"
             f"request_id={uuid.uuid4()}"
@@ -38,8 +38,8 @@ def missing_env_var():
         "message": "'STRIPE_API_KEY'",
         "stack_trace": (
             "Traceback (most recent call last):\n"
-            '  File "/app/config.py", line 12, in load_config\n'
-            "    key = os.environ['STRIPE_API_KEY']\n"
+        '  File "/app/config.py", line 6, in load_config\n'
+        '    key = os.environ["STRIPE_API_KEY"]\n'
             "KeyError: 'STRIPE_API_KEY'"
         ),
     }
@@ -53,9 +53,10 @@ def db_timeout():
         "message": "connection pool timeout",
         "stack_trace": (
             "Traceback (most recent call last):\n"
-            '  File "/app/db.py", line 88, in get_connection\n'
-            f"    conn = pool.acquire(timeout={random.choice([30, 30, 30, 60])})\n"
-            "TimeoutError: connection pool timeout after waiting for a free connection\n"
+        '  File "/app/db.py", line 9, in get_connection\n'
+        "    conn = self.pool.acquire(timeout=30)\n"
+            "TimeoutError: connection pool timeout after waiting for a free "
+            "connection\n"
             f"pid={random.randint(1000, 9999)}"
         ),
     }
