@@ -5,6 +5,7 @@ from aiops.agent.fake_llm import make_demo_llm
 from aiops.api import main
 from aiops.dedup.engine import DedupEngine
 from aiops.rag.store import RunbookStore
+from aiops.sandbox.runner import SandboxResult
 
 
 @pytest.fixture
@@ -14,6 +15,7 @@ def client_and_store(tmp_path):
     store = RunbookStore(path=str(tmp_path / "chroma"))
     store.load_directory("runbooks/default")
     main.app.dependency_overrides[main.get_store] = lambda: store
+    main.app.dependency_overrides[main.get_sandbox] = lambda: None
     with TestClient(main.app) as client:
         yield client, store
     main.app.dependency_overrides.clear()
@@ -75,3 +77,23 @@ def test_analyze_without_model_returns_503(client_and_store, monkeypatch):
     )
     assert response.status_code == 503
     assert "LLM_MODEL" in response.json()["detail"]
+
+
+def test_analyze_includes_sandbox_verification(client_and_store):
+    class FakeSandbox:
+        def baseline(self):
+            return SandboxResult(
+                "failed", 1, "", 0.1, 4, 2,
+                failed_tests=["test_users.py::test_missing_user_gives_clear_error_not_attributeerror"],
+            )
+
+        def verify(self, rel_path, new_source):
+            return SandboxResult("passed", 0, "", 0.1, 6, 0)
+
+    client, _ = client_and_store
+    main.app.dependency_overrides[main.get_llm] = make_demo_llm
+    main.app.dependency_overrides[main.get_sandbox] = lambda: FakeSandbox()
+    incident_id = _send_users_crash(client)
+    response = client.post(f"/api/v1/incidents/{incident_id}/analyze")
+    assert response.status_code == 200
+    assert response.json()["verification"]["status"] == "fix_confirmed"

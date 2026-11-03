@@ -10,6 +10,8 @@ from aiops.agent.llm import GroqLLM, MissingAPIKeyError, MissingModelError
 from aiops.dedup.engine import DedupEngine
 from aiops.ingest.schemas import LogEvent
 from aiops.rag.store import RunbookStore
+from aiops.sandbox.app_sandbox import AppSandbox
+from aiops.sandbox.runner import is_docker_available
 
 load_dotenv()
 
@@ -39,6 +41,12 @@ def get_llm():
         raise HTTPException(status_code=503, detail=str(error))
 
 
+def get_sandbox():
+    if os.getenv("AIOPS_SANDBOX", "on") != "off" and is_docker_available():
+        return AppSandbox(REPO_ROOT)
+    return None
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -61,7 +69,8 @@ def list_incidents():
 
 @app.post("/api/v1/incidents/{incident_id}/analyze")
 def analyze_incident(incident_id: int, llm=Depends(get_llm),
-                     store=Depends(get_store)):
+                     store=Depends(get_store),
+                     sandbox=Depends(get_sandbox)):
     incident = engine.incidents.get(incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -72,5 +81,6 @@ def analyze_incident(incident_id: int, llm=Depends(get_llm),
         service_name=incident.service_name,
         repo_root=REPO_ROOT,
         incident_id=incident.id,
+        sandbox=sandbox,
     )
     return summarize(state)

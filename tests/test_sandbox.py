@@ -10,6 +10,7 @@ import pytest
 from aiops.sandbox.runner import (
     build_tar,
     is_docker_available,
+    parse_failed_tests,
     parse_pytest_summary,
     run_tests_in_sandbox,
 )
@@ -49,6 +50,18 @@ def test_parse_pytest_summary_counts_passed_and_failed():
     assert parse_pytest_summary("2 failed in 0.13s") == (0, 2)
     assert parse_pytest_summary("no tests ran in 0.01s") == (0, 0)
     assert parse_pytest_summary("some non-summary output") == (None, None)
+
+
+def test_parse_failed_tests_extracts_node_ids_without_messages():
+    output = (
+        "FAILED test_users.py::test_missing_user - AssertionError: expected error\n"
+        "ERROR test_db.py::test_pool - setup failed\n"
+        "PASSED test_ok.py::test_ok\n"
+    )
+    assert parse_failed_tests(output) == [
+        "test_users.py::test_missing_user",
+        "test_db.py::test_pool",
+    ]
 
 
 def test_build_tar_sets_sandbox_uid_gid_and_permissions():

@@ -1,0 +1,75 @@
+"""Demonstrate the fake agent with real, isolated sandbox test runs."""
+import sys
+
+sys.path.insert(0, "src")
+
+from aiops.agent.fake_llm import make_demo_llm_4b
+from aiops.agent.graph import run_agent
+from aiops.sandbox.app_sandbox import AppSandbox
+from aiops.sandbox.runner import is_docker_available
+
+REPO_ROOT = "mock_services/sample_app"
+CRASHES = [
+    ("user-service", """Traceback (most recent call last):
+  File "/app/users.py", line 19, in get_user_email
+    return user.email
+AttributeError: 'NoneType' object has no attribute 'email'"""),
+    ("payment-service", """Traceback (most recent call last):
+  File "/app/config.py", line 6, in load_config
+    key = os.environ["STRIPE_API_KEY"]
+KeyError: 'STRIPE_API_KEY'"""),
+    ("order-service", """Traceback (most recent call last):
+  File "/app/db.py", line 9, in get_connection
+    conn = self.pool.acquire(timeout=30)
+TimeoutError: connection pool timeout after waiting for a free connection"""),
+]
+
+
+def main():
+    if not is_docker_available():
+        print("Docker is not running. Start Docker Desktop and try again.")
+        return 1
+
+    print("=" * 72)
+    print("PRETEND AI: canned LLM answers; REAL Docker sandbox test execution.")
+    print("The sandbox is isolated and does not have network access.")
+    print("=" * 72)
+    llm = make_demo_llm_4b()
+    sandbox = AppSandbox(REPO_ROOT)
+    for service_name, trace in CRASHES:
+        state = run_agent(
+            llm,
+            None,
+            trace=trace,
+            service_name=service_name,
+            repo_root=REPO_ROOT,
+            sandbox=sandbox,
+        )
+        verification = state.get("verification")
+        print(f"\nService: {service_name}")
+        print(f"Status: {state.get('status')}")
+        print(f"Attempts: {state.get('attempt', 0)}")
+        print(
+            "Verification: "
+            f"{verification.status if verification else 'skipped'}"
+        )
+        if verification and verification.message:
+            print(f"Verification message: {verification.message}")
+        print("Rejected attempts:")
+        if state.get("history"):
+            for entry in state["history"]:
+                print(
+                    f"  Attempt {entry['attempt']} "
+                    f"[{entry.get('stage', 'diff')}]: {entry['error']}"
+                )
+        else:
+            print("  (none)")
+        if state.get("patch"):
+            print("Patch:\n{}".format(state["patch"]))
+        else:
+            print("Reason: {}".format(state.get("reason", "")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

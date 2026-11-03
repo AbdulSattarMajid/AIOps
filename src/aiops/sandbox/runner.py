@@ -2,8 +2,8 @@ import io
 import re
 import tarfile
 import time
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import docker
 from docker.errors import DockerException, ImageNotFound
@@ -20,6 +20,7 @@ _SUMMARY_LINE = re.compile(
 )
 _PASSED = re.compile(r"(\d+)\s+passed")
 _FAILED = re.compile(r"(\d+)\s+failed")
+_FAILED_TEST = re.compile(r"^(?:FAILED|ERROR) (\S+)")
 
 
 @dataclass
@@ -31,6 +32,7 @@ class SandboxResult:
     tests_passed: Optional[int]
     tests_failed: Optional[int]
     message: str = ""
+    failed_tests: List[str] = field(default_factory=list)
 
 
 def validate_files(files: Dict[str, str]) -> None:
@@ -98,6 +100,15 @@ def parse_pytest_summary(output: str) -> Tuple[Optional[int], Optional[int]]:
             int(failed_match.group(1)) if failed_match else 0,
         )
     return None, None
+
+
+def parse_failed_tests(output: str) -> List[str]:
+    failed = []
+    for line in output.splitlines():
+        match = _FAILED_TEST.match(line)
+        if match:
+            failed.append(match.group(1))
+    return failed
 
 
 def _client_or_default(client):
@@ -181,16 +192,18 @@ def run_tests_in_sandbox(
             pass
 
         passed, failed = parse_pytest_summary(output)
+        failed_tests = parse_failed_tests(output)
         elapsed = time.monotonic() - started_at
         if timed_out:
             return SandboxResult(
                 "timeout", exit_code, output, elapsed, passed, failed,
                 f"Tests exceeded the {timeout_seconds}-second timeout.",
+                failed_tests,
             )
         if oom_killed or exit_code == 137:
             return SandboxResult(
                 "error", exit_code, output, elapsed, passed, failed,
-                f"Sandbox exceeded its memory limit ({memory}).",
+                f"Sandbox exceeded its memory limit ({memory}).", failed_tests,
             )
         if exit_code == 0:
             status, message = "passed", ""
@@ -201,7 +214,8 @@ def run_tests_in_sandbox(
         else:
             status, message = "error", f"Sandbox exited with unexpected code {exit_code}."
         return SandboxResult(
-            status, exit_code, output, elapsed, passed, failed, message
+            status, exit_code, output, elapsed, passed, failed, message,
+            failed_tests,
         )
     except ImageNotFound:
         elapsed = time.monotonic() - started_at
