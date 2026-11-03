@@ -1,3 +1,4 @@
+from tests.conftest import TEST_API_KEY
 import json
 
 import pytest
@@ -52,7 +53,7 @@ def client_and_store(tmp_path):
     store.load_directory("runbooks/default")
     main.app.dependency_overrides[main.get_store] = lambda: store
     main.app.dependency_overrides[main.get_sandbox] = lambda: None
-    with TestClient(main.app) as client:
+    with TestClient(main.app, headers={"X-API-Key": TEST_API_KEY}) as client:
         yield client, store
     main.app.dependency_overrides.clear()
 

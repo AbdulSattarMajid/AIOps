@@ -6,6 +6,7 @@ from aiops.api import main
 from aiops.dedup.engine import DedupEngine
 from aiops.rag.store import RunbookStore
 from aiops.sandbox.runner import SandboxResult
+from tests.conftest import TEST_API_KEY
 
 
 @pytest.fixture
@@ -17,7 +18,7 @@ def client_and_store(tmp_path):
     main.app.dependency_overrides[main.get_store] = lambda: store
     main.app.dependency_overrides[main.get_sandbox] = lambda: None
     main.app.dependency_overrides.pop(main.get_github, None)
-    with TestClient(main.app) as client:
+    with TestClient(main.app, headers={"X-API-Key": TEST_API_KEY}) as client:
         yield client, store
     main.app.dependency_overrides.clear()
 
