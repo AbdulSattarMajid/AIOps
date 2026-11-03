@@ -59,7 +59,7 @@ Final verification:
 ```text
 pytest: 64 passed
 Ruff checks: passed
-Anthropic/Claude reference search: no matches
+Provider reference search: no matches
 Tracked-file API-key-pattern scan: no matches
 ```
 

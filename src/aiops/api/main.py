@@ -2,12 +2,14 @@ import os
 from dataclasses import asdict
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 
 from aiops.agent.fake_llm import make_demo_llm
 from aiops.agent.graph import run_agent, summarize
 from aiops.agent.llm import GroqLLM, MissingAPIKeyError, MissingModelError
 from aiops.dedup.engine import DedupEngine
+from aiops.delivery.github_pr import DeliveryError, PyGithubClient, deliver
+from aiops.delivery.slack import build_slack_text, post_slack
 from aiops.ingest.schemas import LogEvent
 from aiops.rag.store import RunbookStore
 from aiops.sandbox.app_sandbox import AppSandbox
@@ -47,6 +49,25 @@ def get_sandbox():
     return None
 
 
+def get_github(deliver: bool = Query(False)):
+    if not deliver:
+        return None
+    token = os.getenv("GITHUB_TOKEN")
+    repository = os.getenv("GITHUB_REPO")
+    if not token or not repository:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "GitHub delivery is not configured. Set GITHUB_TOKEN and "
+                "GITHUB_REPO in .env."
+            ),
+        )
+    try:
+        return PyGithubClient(token, repository)
+    except DeliveryError as error:
+        raise HTTPException(status_code=503, detail=str(error))
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -70,7 +91,9 @@ def list_incidents():
 @app.post("/api/v1/incidents/{incident_id}/analyze")
 def analyze_incident(incident_id: int, llm=Depends(get_llm),
                      store=Depends(get_store),
-                     sandbox=Depends(get_sandbox)):
+                     sandbox=Depends(get_sandbox),
+                     deliver_requested: bool = Query(False, alias="deliver"),
+                     github=Depends(get_github)):
     incident = engine.incidents.get(incident_id)
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
@@ -83,4 +106,26 @@ def analyze_incident(incident_id: int, llm=Depends(get_llm),
         incident_id=incident.id,
         sandbox=sandbox,
     )
-    return summarize(state)
+    response = summarize(state)
+    if deliver_requested:
+        incident_data = {
+            "id": incident.id,
+            "service_name": incident.service_name,
+            "signature": state.get("signature", ""),
+            "occurrences": incident.count,
+        }
+        webhook = os.getenv("SLACK_WEBHOOK_URL", "")
+        slack_callback = None
+        if webhook:
+            slack_callback = lambda url: post_slack(
+                webhook, build_slack_text(response, incident_data, url)
+            )
+        delivery = deliver(
+            response,
+            incident_data,
+            github,
+            path_prefix=os.getenv("TARGET_REPO_PATH_PREFIX", ""),
+            slack=slack_callback,
+        )
+        response["delivery"] = asdict(delivery)
+    return response

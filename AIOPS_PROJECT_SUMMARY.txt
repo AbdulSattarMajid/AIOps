@@ -1,0 +1,12 @@
+AIOps Project: Progress Summary
+
+1. Project goal: detect recurring application errors and help engineers resolve them safely.
+2. Logs are ingested, normalized, deduplicated, and grouped into incidents.
+3. A retrieval component finds relevant runbooks to provide troubleshooting context.
+4. A LangGraph agent inspects Python tracebacks and proposes a focused code patch.
+5. Diff validation limits changes to the intended source file and function.
+6. Groq is the configured real LLM provider; canned responses support offline demos and tests.
+7. An isolated Docker sandbox compares test results before and after each patch.
+8. The agent retries rejected patches and reports verified, unverified, or escalated outcomes.
+9. Week 4C adds opt-in GitHub draft PR delivery with stale-file checks and optional Slack notification.
+10. Current status: 129 tests pass; local demos work; live GitHub/Slack delivery has not been run, and changes remain uncommitted.
