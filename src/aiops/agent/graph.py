@@ -386,6 +386,11 @@ def summarize(state: Dict) -> Dict:
     verification = state.get("verification")
     if is_dataclass(verification):
         verification = asdict(verification)
+    baseline_result = state.get("baseline_result")
+    baseline_failed_tests = (
+        list(getattr(baseline_result, "failed_tests", []))
+        if baseline_result is not None else []
+    )
     return {
         "incident_id": state.get("incident_id"),
         "status": state.get("status"),
@@ -401,6 +406,19 @@ def summarize(state: Dict) -> Dict:
         "runbooks": [item.get("title", "") for item in state.get("runbooks", [])],
         "tokens_used": state.get("tokens_used", 0),
         "model": state.get("model", ""),
+        "baseline_tests_passed": (
+            getattr(baseline_result, "tests_passed", None)
+            if baseline_result is not None else None
+        ),
+        "baseline_tests_failed": (
+            getattr(baseline_result, "tests_failed", None)
+            if baseline_result is not None else None
+        ),
+        "baseline_failed_tests": baseline_failed_tests,
+        "after_failed_tests": (
+            list(verification.get("after_failed_tests", []))
+            if isinstance(verification, dict) else []
+        ),
         "history": [
             {key: value for key, value in entry.items() if key != "reply"}
             for entry in state.get("history", [])

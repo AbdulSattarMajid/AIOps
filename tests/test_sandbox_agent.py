@@ -147,6 +147,10 @@ def test_graph_verified_path_and_summary():
     assert state["attempt"] == 1
     assert state["status"] == "verified"
     assert summary["verification"]["status"] == "fix_confirmed"
+    assert summary["baseline_tests_passed"] == 5
+    assert summary["baseline_tests_failed"] == 1
+    assert summary["baseline_failed_tests"] == [baseline_failure]
+    assert summary["after_failed_tests"] == []
     assert sandbox.baseline_calls == 1
     assert len(sandbox.verify_calls) == 1
 

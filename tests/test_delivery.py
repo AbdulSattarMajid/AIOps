@@ -42,7 +42,12 @@ def verified_summary(**updates):
             "tests_failed": 0,
             "fixed": ["test_users.py::test_missing_user"],
             "newly_failing": [],
+            "after_failed_tests": [],
         },
+        "baseline_tests_passed": 5,
+        "baseline_tests_failed": 1,
+        "baseline_failed_tests": ["test_users.py::test_missing_user"],
+        "after_failed_tests": [],
         "attempts": 2,
         "tokens_used": 123,
         "model": "fake",
@@ -117,8 +122,14 @@ def test_render_pr_has_evidence_and_safety_text():
     title, body = render_pr(summary, INCIDENT)
     assert title.startswith("AIOps fix: user-service")
     assert PATCH.strip() in body
-    assert "Tests passed" in body and "6" in body
-    assert "Tests failed" in body and "0" in body
+    assert "- After the change: `6` passed, `0` failed" in body
+    assert "- Before the change: `5` passed, `1` failed" in body
+    assert "- Fixed by this change:\n  - `test_users.py::test_fixed @\u200bsomeone`" in body
+    assert "- Newly failing: none" in body
+    assert (
+        "- Still failing, also failing before this change "
+        "(unrelated to this fix): none"
+    ) in body
     assert "Generated automatically by AIOps. Review carefully." in body
     assert "@\u200bsomeone" in body
     assert "@someone" not in body
@@ -133,6 +144,84 @@ def test_render_pr_neutralizes_backticks_in_log_text():
     assert body.count("```") >= 2
     assert "Failure ```\n@someone" not in body
     assert "@\u200bsomeone" in body
+
+
+def test_render_pr_uses_inline_values_and_bullet_lists():
+    summary = verified_summary(
+        file="src/user\nmodule.py",
+        function="lookup`user\nemail",
+        model="model`name\n@name",
+        runbooks=["Null `result\n@name", "Second runbook"],
+        baseline_tests_passed=4,
+        baseline_tests_failed=2,
+        baseline_failed_tests=[
+            "test_users.py::test_missing_user",
+            "test_config.py::test_old_config_failure",
+        ],
+        after_failed_tests=["test_config.py::test_old_config_failure"],
+    )
+    summary["verification"].update({
+        "fixed": ["test_users.py::test_missing_user"],
+        "newly_failing": ["test_db.py::test_new_failure"],
+        "tests_passed": 5,
+        "tests_failed": 1,
+        "after_failed_tests": ["test_config.py::test_old_config_failure"],
+    })
+    incident = {
+        **INCIDENT,
+        "service_name": "user\nservice @name`",
+        "signature": "Error`type\n@name",
+        "occurrences": "4\n@name`",
+    }
+
+    title, body = render_pr(summary, incident)
+
+    assert "user service @\u200bname`" in title
+    assert "- Service: `` user service @\u200bname` ``" in body
+    assert "- Error signature: ``Error`type @\u200bname``" in body
+    assert "- Occurrences: `` 4 @\u200bname` ``" in body
+    assert "- File: `src/user module.py`" in body
+    assert "- Function: ``lookup`user email``" in body
+    assert "- Model: ``model`name @\u200bname``" in body
+    assert "- Fixed by this change:\n  - `test_users.py::test_missing_user`" in body
+    assert "- Newly failing:\n  - `test_db.py::test_new_failure`" in body
+    assert (
+        "- Still failing, also failing before this change "
+        "(unrelated to this fix):\n"
+        "  - `test_config.py::test_old_config_failure`"
+    ) in body
+    assert (
+        "- Runbooks consulted:\n"
+        "  - ``Null `result @\u200bname``\n"
+        "  - `Second runbook`"
+    ) in body
+    assert "\n" not in body.split("- Service: ", 1)[1].split("\n", 1)[0]
+    assert "@name" not in body
+
+
+def test_render_pr_empty_lists_render_none_and_diff_fence_is_preserved():
+    summary = verified_summary(
+        patch="ordinary diff text\n```\nmalicious content\n```",
+        runbooks=[],
+        baseline_failed_tests=[],
+        after_failed_tests=[],
+    )
+    summary["verification"].update({
+        "fixed": [],
+        "newly_failing": [],
+        "after_failed_tests": [],
+    })
+    _, body = render_pr(summary, INCIDENT)
+
+    assert "- Fixed by this change: none" in body
+    assert "- Newly failing: none" in body
+    assert (
+        "- Still failing, also failing before this change "
+        "(unrelated to this fix): none"
+    ) in body
+    assert "- Runbooks consulted: none" in body
+    assert body.count("```") == 2
+    assert "``\u200b`" in body
 
 
 def test_render_pr_caps_title_and_marks_unverified():

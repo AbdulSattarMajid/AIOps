@@ -16,8 +16,11 @@ Before creating a branch or PR, delivery:
 5. Creates a deterministic `aiops/fix-...` branch and writes only to that
    branch, then opens a draft PR.
 
-Log-derived values are treated as untrusted in PR text: dynamic text is
-code-fenced, embedded fences are neutralized, and `@` mentions are disabled.
+Log-derived values are treated as untrusted in PR text: short values are
+newline-flattened and placed in inline code spans with safe delimiters, lists
+are rendered as inline-code bullets, embedded fences are neutralized in the
+diff block, and `@` mentions are disabled. Test evidence includes baseline and
+after-change counts and distinguishes unrelated pre-existing failures.
 GitHub errors redact the configured token. Slack notifications contain only a
 short incident summary and PR link; notification errors do not fail delivery.
 
@@ -39,7 +42,8 @@ short incident summary and PR link; notification errors do not fail delivery.
 ## Updated files
 
 - `src/aiops/agent/graph.py` includes the original and final file source in the
-  agent summary so delivery can revalidate the patch.
+  agent summary so delivery can revalidate the patch, plus baseline test
+  counts and failure IDs for PR evidence.
 - `src/aiops/api/main.py` adds `deliver=true` as an opt-in API query parameter,
   along with overridable GitHub dependency injection and optional Slack
   notification.
@@ -71,8 +75,8 @@ payment patches were `patch_ready`, and the order incident returned `no_patch`.
 ## Verification
 
 ```text
-pytest -q: 129 passed
-Docker integration tests: 11 ran, 0 skipped
+pytest -q: 131 passed
+Docker integration tests: 12 ran, 0 skipped
 Credential-pattern scan: no matches
 Anthropic/Claude reference scan: no matches
 docker ps -a | findstr aiops: no leftover aiops containers

@@ -13,6 +13,7 @@ class Verification:
     newly_failing: List[str] = field(default_factory=list)
     still_failing: List[str] = field(default_factory=list)
     fixed: List[str] = field(default_factory=list)
+    after_failed_tests: List[str] = field(default_factory=list)
     message: str = ""
 
 
@@ -34,6 +35,7 @@ def evaluate_verification(baseline: SandboxResult, after: SandboxResult,
         "newly_failing": newly_failing,
         "still_failing": still_failing,
         "fixed": fixed,
+        "after_failed_tests": sorted(after_failures),
     }
     if after.status == "error":
         return Verification(
