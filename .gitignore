@@ -8,3 +8,8 @@ chroma_data/
 *.log
 .idea/
 .vscode/
+.env.*
+!.env.example
+.mypy_cache/
+.coverage
+htmlcov/
