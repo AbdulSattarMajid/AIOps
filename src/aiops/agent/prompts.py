@@ -43,6 +43,7 @@ def _clean(text: str) -> str:
 def fence(tag: str, text: str, **attrs: str) -> str:
     safe_text = text.replace("<untrusted", "<_untrusted")
     safe_text = safe_text.replace("</untrusted", "</_untrusted")
+    safe_text = safe_text.replace("```", "``\u200b`")
     attributes = "".join(
         ' {}="{}"'.format(
             key, re.sub(r"[^\w ./:-]", "", str(value))[:100]

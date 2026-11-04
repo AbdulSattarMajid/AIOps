@@ -35,6 +35,11 @@ class _FileDiff:
 
 
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
+_DANGEROUS_ADDED_PATTERNS = (
+    re.compile(r"\b(?:import|from)\s+(?:requests|urllib|socket|subprocess)\b"),
+    re.compile(r"\b(?:requests|urllib|socket|subprocess)\s*\."),
+    re.compile(r"\bos\s*\.\s*system\s*\("),
+)
 _DIFF_INSTRUCTIONS = (
     "After the '+++ b/<file>' line, each section must start with a line like "
     "'@@ -17,3 +17,5 @@' and every following line must start with a space "
@@ -254,6 +259,17 @@ def _check_added_lines_for_secrets(hunks: List[_Hunk]) -> None:
         )
 
 
+def _check_added_lines_for_dangerous_calls(hunks: List[_Hunk]) -> None:
+    for kind, text in (line for hunk in hunks for line in hunk.lines):
+        if kind == "+" and any(
+            pattern.search(text) for pattern in _DANGEROUS_ADDED_PATTERNS
+        ):
+            raise DiffError(
+                "Patch adds a network or process execution call; rejecting "
+                "the added line."
+            )
+
+
 def validate_diff(reply: str, rel_path: str, source: str,
                   func_range: Optional[Tuple[int, int]] = None
                   ) -> ValidationResult:
@@ -279,6 +295,7 @@ def validate_diff(reply: str, rel_path: str, source: str,
         # Reject before applying: a patch that adds a hardcoded secret must
         # never produce a new_source that we then send to the sandbox or repo.
         _check_added_lines_for_secrets(file_diff.hunks)
+        _check_added_lines_for_dangerous_calls(file_diff.hunks)
         new_source = _apply_hunks(source, file_diff.hunks, func_range)
         if new_source == source:
             raise DiffError("Diff does not change the source.")
