@@ -19,12 +19,19 @@ from aiops.rag.store import RunbookStore
 from aiops.sandbox.app_sandbox import AppSandbox
 from aiops.sandbox.runner import is_docker_available
 from aiops.security.auth import get_configured_hashes, redact_headers, verify_api_key
+from aiops.security.redaction import redact_log_event
 from aiops.security.ratelimit import (
     RateLimiter,
     default_limiter,
     get_rate_limit_config,
 )
-from aiops.storage.redis_store import RedisStoreError
+from aiops.storage.redis_store import (
+    DEAD_LETTER_STREAM,
+    QUEUE_STREAM,
+    RedisStoreError,
+    enqueue_event,
+    queue_stats,
+)
 
 load_dotenv()
 
@@ -255,15 +262,53 @@ def health():
 
 @app.post("/api/v1/telemetry/logs")
 def ingest_log(event: LogEvent):
+    if os.getenv("AIOPS_INGEST_MODE", "queue").lower() != "inline":
+        redacted_event, _ = redact_log_event(event)
+        try:
+            event_id = enqueue_event(
+                redacted_event.model_dump(mode="json"),
+                stream=QUEUE_STREAM,
+            )
+        except RedisStoreError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=str(error),
+                headers={"Retry-After": "5"},
+            ) from error
+        return JSONResponse(
+            status_code=202,
+            content={"status": "accepted", "event_id": event_id},
+        )
+
+    # Inline mode is for tests and local development; production defaults to queue.
     try:
         incident, is_new = engine.process(event)
     except RedisStoreError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+            headers={"Retry-After": "5"},
+        ) from error
     return {
         "incident_id": incident.id,
         "is_new": is_new,
         "occurrence_count": incident.count,
     }
+
+
+@app.get("/api/v1/queue/stats")
+def get_queue_stats():
+    try:
+        return queue_stats(
+            stream=QUEUE_STREAM,
+            dead_letter_stream=DEAD_LETTER_STREAM,
+        )
+    except RedisStoreError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+            headers={"Retry-After": "5"},
+        ) from error
 
 
 @app.get("/api/v1/incidents")

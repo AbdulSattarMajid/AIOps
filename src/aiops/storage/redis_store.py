@@ -16,6 +16,12 @@ from redis.exceptions import RedisError, WatchError
 
 DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_VECTORS_PER_SERVICE = 500
+DEDUP_LOCK_TTL_SECONDS = 10
+DEDUP_LOCK_WAIT_SECONDS = 15
+QUEUE_STREAM = "aiops:events"
+DEAD_LETTER_STREAM = "aiops:events:dead"
+CONSUMER_GROUP = "aiops-workers"
+DEFAULT_STREAM_MAX_LEN = 50000
 
 
 class RedisStoreError(RuntimeError):
@@ -29,6 +35,7 @@ class DedupStore(Protocol):
         signature: str,
         vector: List[float],
         threshold: float,
+        event_id: Optional[str] = None,
     ) -> Tuple[Dict, bool]: ...
 
     def get_incident(self, incident_id: int) -> Optional[Dict]: ...
@@ -131,22 +138,37 @@ class RedisStore:
         signature: str,
         vector: List[float],
         threshold: float,
+        event_id: Optional[str] = None,
     ) -> Tuple[Dict, bool]:
         service_name = event["service_name"]
         lock_key = self._lock_key(service_name)
         token = uuid.uuid4().hex
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + DEDUP_LOCK_WAIT_SECONDS
         client = None
         acquired = False
         try:
             client = self._client()
-            while not client.set(lock_key, token, nx=True, ex=120):
+            while not client.set(
+                lock_key, token, nx=True, ex=DEDUP_LOCK_TTL_SECONDS
+            ):
                 if time.monotonic() >= deadline:
                     raise RedisStoreError(
                         "Redis deduplication lock could not be acquired."
                     )
                 time.sleep(0.005)
             acquired = True
+
+            processed_key = (
+                f"{self.prefix}processed:{event_id}" if event_id else None
+            )
+            if processed_key:
+                processed_id = client.get(processed_key)
+                if processed_id is not None:
+                    processed_incident = self._load_incident(
+                        client, int(processed_id)
+                    )
+                    if processed_incident is not None:
+                        return processed_incident, False
 
             signature_key = self._signature_key(signature)
             incident_id = client.get(signature_key)
@@ -161,6 +183,10 @@ class RedisStore:
                         ex=self.ttl_seconds,
                     )
                     pipe.set(signature_key, incident["id"], ex=self.ttl_seconds)
+                    if processed_key:
+                        pipe.set(
+                            processed_key, incident["id"], ex=self.ttl_seconds
+                        )
                     pipe.execute()
                     return incident, False
 
@@ -192,6 +218,8 @@ class RedisStore:
                         ex=self.ttl_seconds,
                     )
                     pipe.set(signature_key, near_id, ex=self.ttl_seconds)
+                    if processed_key:
+                        pipe.set(processed_key, near_id, ex=self.ttl_seconds)
                     pipe.execute()
                     return incident, False
 
@@ -214,6 +242,8 @@ class RedisStore:
                 ex=self.ttl_seconds,
             )
             pipe.set(signature_key, incident_id, ex=self.ttl_seconds)
+            if processed_key:
+                pipe.set(processed_key, incident_id, ex=self.ttl_seconds)
             pipe.rpush(
                 vectors_key,
                 json.dumps(
@@ -273,6 +303,7 @@ class InMemoryStore:
         self._by_signature: Dict[str, int] = {}
         self._vectors: Dict[str, List[Dict]] = {}
         self._next_id = 1
+        self._processed: Dict[str, int] = {}
         self._lock = threading.RLock()
 
     def process(
@@ -281,13 +312,19 @@ class InMemoryStore:
         signature: str,
         vector: List[float],
         threshold: float,
+        event_id: Optional[str] = None,
     ) -> Tuple[Dict, bool]:
         with self._lock:
+            if event_id and event_id in self._processed:
+                incident_id = self._processed[event_id]
+                return dict(self._incidents[incident_id]), False
             incident_id = self._by_signature.get(signature)
             if incident_id is not None:
                 incident = RedisStore._bump(
                     self._incidents[incident_id], event
                 )
+                if event_id:
+                    self._processed[event_id] = incident_id
                 return incident, False
 
             candidates = self._vectors.get(event["service_name"], [])
@@ -295,6 +332,8 @@ class InMemoryStore:
             if near_id is not None:
                 self._by_signature[signature] = near_id
                 incident = RedisStore._bump(self._incidents[near_id], event)
+                if event_id:
+                    self._processed[event_id] = near_id
                 return incident, False
 
             incident_id = self._next_id
@@ -312,6 +351,8 @@ class InMemoryStore:
             }
             self._incidents[incident_id] = incident
             self._by_signature[signature] = incident_id
+            if event_id:
+                self._processed[event_id] = incident_id
             vectors = self._vectors.setdefault(event["service_name"], [])
             vectors.append({"id": incident_id, "vector": vector})
             del vectors[:-self.max_vectors_per_service]
@@ -325,3 +366,62 @@ class InMemoryStore:
     def list_incidents(self) -> List[Dict]:
         with self._lock:
             return [dict(item) for item in self._incidents.values()]
+
+
+def _stream_max_len() -> int:
+    return int(os.getenv("STREAM_MAX_LEN") or DEFAULT_STREAM_MAX_LEN)
+
+
+def enqueue_event(event: Dict, client=None, stream: str = QUEUE_STREAM) -> str:
+    """Append a redacted JSON event without silently trimming a full queue."""
+    max_len = _stream_max_len()
+    try:
+        client = client if client is not None else get_redis()
+        while True:
+            pipe = client.pipeline()
+            try:
+                pipe.watch(stream)
+                if pipe.xlen(stream) >= max_len:
+                    raise RedisStoreError("The ingestion stream is full.")
+                pipe.multi()
+                event_id = pipe.xadd(
+                    stream,
+                    {"event": json.dumps(event, separators=(",", ":"))},
+                    maxlen=max_len,
+                    approximate=True,
+                )
+                return pipe.execute()[0]
+            except WatchError:
+                continue
+            finally:
+                pipe.reset()
+    except RedisStoreError:
+        raise
+    except RedisError:
+        raise RedisStoreError(
+            "Redis queue is unavailable; the event was not enqueued."
+        ) from None
+
+
+def queue_stats(
+    client=None,
+    stream: str = QUEUE_STREAM,
+    dead_letter_stream: str = DEAD_LETTER_STREAM,
+) -> Dict[str, int]:
+    try:
+        client = client if client is not None else get_redis()
+        try:
+            client.xgroup_create(stream, CONSUMER_GROUP, id="0", mkstream=True)
+        except redis.ResponseError as error:
+            if "BUSYGROUP" not in str(error):
+                raise
+        pending = client.xpending(stream, CONSUMER_GROUP)
+        return {
+            "stream_length": client.xlen(stream),
+            "pending_count": int(pending.get("pending", 0)),
+            "dead_letter_count": client.xlen(dead_letter_stream),
+        }
+    except RedisError:
+        raise RedisStoreError(
+            "Redis queue is unavailable; queue statistics cannot be read."
+        ) from None

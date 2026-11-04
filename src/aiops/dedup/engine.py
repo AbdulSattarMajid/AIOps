@@ -58,7 +58,9 @@ class DedupEngine:
             for incident in self.store.list_incidents()
         }
 
-    def process(self, event: LogEvent) -> Tuple[Incident, bool]:
+    def process(
+        self, event: LogEvent, event_id: str | None = None
+    ) -> Tuple[Incident, bool]:
         """Returns (incident, is_new). is_new is False when this error was seen before."""
         event, findings = redact_log_event(event)
         normalized = normalize_trace(f"{event.error_class} {event.stack_trace}")
@@ -77,6 +79,7 @@ class DedupEngine:
             signature,
             vector.tolist(),
             self.threshold,
+            event_id,
         )
         return Incident(**stored), is_new
 

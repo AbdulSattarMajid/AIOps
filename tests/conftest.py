@@ -46,6 +46,7 @@ def reset_rate_limiter_and_auth():
 def reset_redis(monkeypatch):
     client = fakeredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(redis_store, "get_redis", lambda: client)
+    monkeypatch.setenv("AIOPS_INGEST_MODE", "inline")
     yield
     client.flushdb()
 
