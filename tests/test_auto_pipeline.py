@@ -50,6 +50,7 @@ class FakeSandbox:
 class FakeGitHub:
     def __init__(self):
         self.created_prs = []
+        self.pr_content = None
         self.source = (Path(ROOT) / "users.py").read_text(encoding="utf-8")
 
     def default_branch(self):
@@ -76,16 +77,19 @@ class FakeGitHub:
 
     def create_pr(self, _title, _body, head, base, draft):
         self.created_prs.append((head, base, draft))
+        self.pr_content = (_title, _body)
         return "https://github.test/draft/1"
 
 
-def _client_with_events(count=1):
+def _client_with_events(
+    count=1, error_class="AttributeError", trace=TRACE
+):
     client = fakeredis.FakeRedis(decode_responses=True)
     event = LogEvent(
         timestamp="2026-11-04T10:00:00Z",
         service_name="user-service",
-        error_class="AttributeError",
-        stack_trace=TRACE,
+        error_class=error_class,
+        stack_trace=trace,
     )
     pipe = client.pipeline(transaction=False)
     payload = json.dumps(event.model_dump(mode="json"))
@@ -179,6 +183,35 @@ def test_verified_auto_analysis_opens_one_draft_and_sends_slack(monkeypatch):
     assert "AttributeError" in messages[0]
     assert "tests 0/1 -> 1/0" in messages[0]
     assert "https://github.test/draft/1" in messages[0]
+
+
+def test_auto_pr_uses_redacted_exception_signature_not_dedup_hash(monkeypatch):
+    monkeypatch.setenv("AIOPS_AUTO_ANALYZE", "on")
+    monkeypatch.setenv("AIOPS_AUTO_DELIVER_PR", "on")
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "")
+    secret = "gsk_" + "Z" * 24
+    trace = TRACE.rsplit("\n", 1)[0] + f"\nKeyError: '{secret}'"
+    client = _client_with_events(
+        error_class="KeyError",
+        trace=trace,
+    )
+    llm, analyze = _real_fake_analysis(monkeypatch, [GOOD_DIFF])
+    github, delivery = _fake_delivery()
+
+    assert drain_once(
+        client, 1, engine=_engine(client), auto_analyzer=analyze,
+        auto_deliverer=delivery,
+    ) == 1
+
+    title, body = github.pr_content
+    assert "KeyError:" in title
+    assert "KeyError:" in body
+    assert "<REDACTED_GROQ_KEY>" in title
+    assert "<REDACTED_GROQ_KEY>" in body
+    assert secret not in title
+    assert secret not in body
+    assert len(next(iter(_engine(client).incidents.values())).signature) == 64
+    assert secret not in str(llm.calls)
 
 
 def test_unverified_analysis_never_delivers_and_slack_requests_human(

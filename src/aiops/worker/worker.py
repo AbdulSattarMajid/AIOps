@@ -152,6 +152,15 @@ def _pipeline_slack_text(incident, summary, pr_url):
     return safe_text.replace("@", "@\u200b")[:1000]
 
 
+def _incident_display_signature(incident):
+    traceback_lines = incident.sample_trace.rstrip().splitlines()
+    if traceback_lines:
+        exception_line = traceback_lines[-1].strip()
+        if exception_line.startswith(f"{incident.error_class}:"):
+            return exception_line
+    return incident.error_class
+
+
 def _record_auto_result(processor, incident, status, reason):
     try:
         processor.store.record_analysis_result(incident.id, status, reason)
@@ -241,7 +250,7 @@ def _maybe_auto_analyze(
             "id": incident.id,
             "service_name": incident.service_name,
             "error_class": incident.error_class,
-            "signature": incident.signature,
+            "signature": _incident_display_signature(incident),
             "occurrences": incident.count,
         }
         if deliver_enabled and status == "verified":
