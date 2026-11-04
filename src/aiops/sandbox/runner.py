@@ -1,14 +1,13 @@
 import io
 import re
 import tarfile
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import docker
 from docker.errors import DockerException, ImageNotFound
-from requests.exceptions import ConnectionError as RequestsConnectionError
-from requests.exceptions import Timeout as RequestsTimeout
 
 _DEFAULT_COMMAND = [
     "python", "-m", "pytest", "-q", "-p", "no:cacheprovider"
@@ -111,6 +110,49 @@ def parse_failed_tests(output: str) -> List[str]:
     return failed
 
 
+def _format_exec_output(output) -> str:
+    if isinstance(output, tuple):
+        output = b"".join(part for part in output if part)
+    if isinstance(output, bytes):
+        encoded = output[-(64 * 1024):]
+    else:
+        encoded = str(output).encode("utf-8", errors="replace")[-(64 * 1024):]
+    return encoded.decode("utf-8", errors="replace")
+
+
+def _stage_archive(container, archive: bytes) -> None:
+    api = container.client.api
+    exec_info = api.exec_create(
+        container.id,
+        [
+            "python",
+            "-c",
+            "import sys, tarfile; "
+            "tarfile.open(fileobj=sys.stdin.buffer, mode='r|').extractall('/work')",
+        ],
+        stdin=True,
+        stdout=True,
+        stderr=True,
+        user="1000:1000",
+        workdir="/work",
+    )
+    stream = api.exec_start(exec_info["Id"], socket=True, tty=False)
+    try:
+        stream.sendall(archive)
+    finally:
+        stream.close()
+
+    while True:
+        state = api.exec_inspect(exec_info["Id"])
+        if not state["Running"]:
+            if state["ExitCode"] != 0:
+                raise RuntimeError(
+                    "Docker could not extract the test files into the sandbox."
+                )
+            return
+        time.sleep(0.01)
+
+
 def _client_or_default(client):
     return client if client is not None else docker.from_env()
 
@@ -130,7 +172,6 @@ def run_tests_in_sandbox(
     timeout_seconds: int = 60,
     memory: str = "256m",
     cpus: float = 1.0,
-    pids_limit: int = 128,
     client=None,
 ) -> SandboxResult:
     validate_files(files)
@@ -144,42 +185,80 @@ def run_tests_in_sandbox(
         docker_client = _client_or_default(client)
         container = docker_client.containers.create(
             image,
-            command=command or _DEFAULT_COMMAND,
+            command=["python", "-c", "import time; time.sleep(3600)"],
             working_dir="/work",
             user="1000:1000",
             network_mode="none",
             mem_limit=memory,
             memswap_limit=memory,
             nano_cpus=int(cpus * 1_000_000_000),
-            pids_limit=pids_limit,
+            pids_limit=64,
             cap_drop=["ALL"],
             security_opt=["no-new-privileges"],
+            read_only=True,
+            tmpfs={
+                "/work": "rw,nosuid,noexec,size=64m,uid=1000,gid=1000,mode=0755",
+                "/tmp": "rw,nosuid,noexec,size=64m,uid=1000,gid=1000,mode=1777",
+            },
+            ulimits=[
+                docker.types.Ulimit(name="nofile", soft=1024, hard=1024),
+                docker.types.Ulimit(name="nproc", soft=64, hard=64),
+            ],
+            privileged=False,
             labels={"aiops": "sandbox"},
             detach=True,
         )
-        # /work must remain writable: Docker's copy API cannot extract onto a
-        # read-only root or tmpfs there. Week 5 can harden other paths instead.
-        copied = container.put_archive("/work", build_tar(files))
-        if copied is False:
-            raise RuntimeError("Docker could not copy the test files into the sandbox.")
+        # Docker rejects put_archive on a read-only root, even when /work is tmpfs.
+        # Stream the validated archive to a Python extractor running on /work.
+        # Run tests only after staging, and kill the idle container if they time out.
         container.start()
-        try:
-            wait_result = container.wait(timeout=timeout_seconds)
-            exit_code = wait_result.get("StatusCode")
-        except (RequestsTimeout, RequestsConnectionError, TimeoutError):
+        _stage_archive(container, build_tar(files))
+
+        exec_result = []
+        exec_error = []
+        exec_finished = threading.Event()
+
+        def run_exec():
+            try:
+                api = container.client.api
+                exec_info = api.exec_create(
+                    container.id,
+                    command or _DEFAULT_COMMAND,
+                    stdout=True,
+                    stderr=True,
+                    user="1000:1000",
+                    workdir="/work",
+                )
+                captured_output = bytearray()
+                for stdout, stderr in api.exec_start(
+                    exec_info["Id"], stream=True, demux=True
+                ):
+                    for chunk in (stdout, stderr):
+                        if chunk:
+                            captured_output.extend(chunk)
+                            if len(captured_output) > 64 * 1024:
+                                del captured_output[:len(captured_output) - 64 * 1024]
+                exit_code = api.exec_inspect(exec_info["Id"]).get("ExitCode")
+                exec_result.append((exit_code, bytes(captured_output)))
+            except Exception as error:
+                exec_error.append(error)
+            finally:
+                exec_finished.set()
+
+        exec_thread = threading.Thread(target=run_exec, daemon=True)
+        exec_thread.start()
+        if not exec_finished.wait(timeout_seconds):
             timed_out = True
             try:
                 container.kill()
             except DockerException:
                 pass
-
-        try:
-            output = container.logs(tail=300)
-            if isinstance(output, bytes):
-                output = output.decode("utf-8", errors="replace")
-            output = str(output)[-8000:]
-        except DockerException as error:
-            output = f"Could not read sandbox output: {error}"
+            exec_finished.wait(1)
+        elif exec_error:
+            raise exec_error[0]
+        else:
+            exit_code, captured_output = exec_result[0]
+            output = _format_exec_output(captured_output)
 
         oom_killed = False
         try:
@@ -240,5 +319,5 @@ def run_tests_in_sandbox(
         if container is not None:
             try:
                 container.remove(force=True)
-            except Exception:
+            except DockerException:
                 pass
