@@ -34,7 +34,8 @@ The checked-in `.streamlit/secrets.toml.example` contains placeholders only.
 
 ## Start order
 
-Open four PowerShell windows at the repository root, in this order:
+Open the PowerShell windows at the repository root, in this order. Set the
+project-root and `src` import paths in each Python-service window:
 
 1. Start Redis:
 
@@ -45,25 +46,33 @@ Open four PowerShell windows at the repository root, in this order:
 2. Start the API:
 
    ```powershell
+   $root = (Get-Location).Path
+   $env:PYTHONPATH = "$root;$root\src"
    uvicorn aiops.api.main:app --app-dir src --host 127.0.0.1 --port 8000
    ```
 
 3. Start the queue worker:
 
    ```powershell
-   $env:PYTHONPATH = (Join-Path (Get-Location) "src")
+   $root = (Get-Location).Path
+   $env:PYTHONPATH = "$root;$root\src"
    python -m aiops.worker
    ```
 
 4. Start the target app:
 
    ```powershell
+   $root = (Get-Location).Path
+   $env:PYTHONPATH = "$root;$root\src"
    streamlit run demo_ui/target_app.py --server.address 127.0.0.1 --server.port 8501
    ```
 
 5. Start the dashboard:
 
    ```powershell
+   $root = (Get-Location).Path
+   $env:PYTHONPATH = "$root;$root\src"
+   $env:GITHUB_REPO = "AbdulSattarMajid/aiops-test-target"
    streamlit run demo_ui/dashboard.py --server.address 127.0.0.1 --server.port 8502
    ```
 

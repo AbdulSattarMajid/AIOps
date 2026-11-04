@@ -22,10 +22,10 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 $quotedRoot = "'" + $repoRoot.Replace("'", "''") + "'"
-$apiCommand = "Set-Location -LiteralPath $quotedRoot; uvicorn aiops.api.main:app --app-dir src --host 127.0.0.1 --port 8000"
-$workerCommand = "Set-Location -LiteralPath $quotedRoot; `$env:PYTHONPATH = (Join-Path (Get-Location) 'src'); python -m aiops.worker"
-$targetCommand = "Set-Location -LiteralPath $quotedRoot; streamlit run demo_ui/target_app.py --server.address 127.0.0.1 --server.port 8501"
-$dashboardCommand = "Set-Location -LiteralPath $quotedRoot; streamlit run demo_ui/dashboard.py --server.address 127.0.0.1 --server.port 8502"
+$apiCommand = "Set-Location -LiteralPath $quotedRoot; `$root = (Get-Location).Path; `$env:PYTHONPATH = `"`$root;`$root\src`"; uvicorn aiops.api.main:app --app-dir src --host 127.0.0.1 --port 8000"
+$workerCommand = "Set-Location -LiteralPath $quotedRoot; `$root = (Get-Location).Path; `$env:PYTHONPATH = `"`$root;`$root\src`"; python -m aiops.worker"
+$targetCommand = "Set-Location -LiteralPath $quotedRoot; `$root = (Get-Location).Path; `$env:PYTHONPATH = `"`$root;`$root\src`"; streamlit run demo_ui/target_app.py --server.address 127.0.0.1 --server.port 8501"
+$dashboardCommand = "Set-Location -LiteralPath $quotedRoot; `$root = (Get-Location).Path; `$env:PYTHONPATH = `"`$root;`$root\src`"; `$env:GITHUB_REPO = 'AbdulSattarMajid/aiops-test-target'; streamlit run demo_ui/dashboard.py --server.address 127.0.0.1 --server.port 8502"
 
 Start-Process -FilePath "powershell.exe" -ArgumentList @(
     "-NoExit", "-Command", $apiCommand
