@@ -12,3 +12,5 @@ PyGithub>=2.3
 slack-sdk>=3.27
 pytest>=8.0
 ruff>=0.4
+redis
+fakeredis

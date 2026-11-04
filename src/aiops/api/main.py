@@ -24,6 +24,7 @@ from aiops.security.ratelimit import (
     default_limiter,
     get_rate_limit_config,
 )
+from aiops.storage.redis_store import RedisStoreError
 
 load_dotenv()
 
@@ -254,7 +255,10 @@ def health():
 
 @app.post("/api/v1/telemetry/logs")
 def ingest_log(event: LogEvent):
-    incident, is_new = engine.process(event)
+    try:
+        incident, is_new = engine.process(event)
+    except RedisStoreError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     return {
         "incident_id": incident.id,
         "is_new": is_new,
@@ -264,7 +268,10 @@ def ingest_log(event: LogEvent):
 
 @app.get("/api/v1/incidents")
 def list_incidents():
-    return [asdict(i) for i in engine.incidents.values()]
+    try:
+        return [asdict(i) for i in engine.incidents.values()]
+    except RedisStoreError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @app.post("/api/v1/incidents/{incident_id}/analyze")
@@ -273,7 +280,10 @@ def analyze_incident(incident_id: int, llm=Depends(get_llm),
                      sandbox=Depends(get_sandbox),
                      deliver_requested: bool = Query(False, alias="deliver"),
                      github=Depends(get_github)):
-    incident = engine.incidents.get(incident_id)
+    try:
+        incident = engine.get_incident(incident_id)
+    except RedisStoreError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     state = run_agent(
