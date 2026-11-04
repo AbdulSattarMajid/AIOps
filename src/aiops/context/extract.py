@@ -2,6 +2,8 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 
+from aiops.context.stacktrace import Frame
+
 # Files whose contents must never be read or sent to an AI.
 _DENIED_NAMES = {".env", "id_rsa", "id_ed25519", "credentials", "secrets.json"}
 _DENIED_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
@@ -40,6 +42,32 @@ def resolve_repo_path(frame_file: str, repo_root: str, path_prefix: str = "/app/
     if candidate.suffix != ".py" or not candidate.is_file():
         return None
     return candidate
+
+
+def _is_runtime_frame(frame_file: str) -> bool:
+    normalized_path = frame_file.replace("\\", "/")
+    normalized = normalized_path.lower()
+    return (
+        "<frozen " in normalized
+        or "/site-packages/" in normalized
+        or "site-packages/" in normalized
+        or "/lib/python" in normalized
+        or normalized.startswith("lib/python")
+        or "/Lib/" in normalized_path
+        or normalized_path.startswith("Lib/")
+    )
+
+
+def select_application_frame(
+    frames: list[Frame], repo_root: str, path_prefix: str = "/app/"
+) -> Frame | None:
+    """Choose the innermost traceback frame that safely maps into the app."""
+    for frame in reversed(frames):
+        if _is_runtime_frame(frame.file):
+            continue
+        if resolve_repo_path(frame.file, repo_root, path_prefix) is not None:
+            return frame
+    return None
 
 
 def _functions(tree: ast.AST) -> list[tuple[str, int, int]]:

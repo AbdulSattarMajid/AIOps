@@ -22,9 +22,10 @@ def build_slack_text(summary: dict, incident: dict, pr_url: str) -> str:
     return text
 
 
-def post_slack(webhook_url: str, text: str, post=None) -> None:
+def post_slack(webhook_url: str, text: str, post=None,
+               raise_errors: bool = False) -> bool | None:
     if not webhook_url:
-        return
+        return None
     try:
         sender = post or httpx.post
         response = sender(
@@ -32,6 +33,9 @@ def post_slack(webhook_url: str, text: str, post=None) -> None:
         )
         if hasattr(response, "raise_for_status"):
             response.raise_for_status()
+        return True
     except Exception:
         # Slack is a notification only; a webhook outage must not undo delivery.
-        return
+        if raise_errors:
+            return False
+        return None
