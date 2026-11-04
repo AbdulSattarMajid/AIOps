@@ -26,6 +26,12 @@ _DOCKER_SKIP = pytest.mark.skipif(
 )
 
 
+def _assert_no_sandbox_containers():
+    assert _CLIENT.containers.list(
+        all=True, filters={"label": "aiops=sandbox"}
+    ) == []
+
+
 @_DOCKER_SKIP
 def test_sandbox_container_configuration_is_hardened():
     inspected = []
@@ -129,6 +135,99 @@ def test_sandbox_leaves_no_containers():
         client=_CLIENT,
     )
     assert result.status == "passed"
-    assert _CLIENT.containers.list(
-        all=True, filters={"label": "aiops=sandbox"}
-    ) == []
+    _assert_no_sandbox_containers()
+
+
+@_DOCKER_SKIP
+def test_sandbox_fork_bomb_hits_pids_limit_and_finishes():
+    code = textwrap.dedent("""\
+        import errno
+        import os
+        import time
+
+        def test_forks_are_limited():
+            children = []
+            blocked = False
+            for _ in range(128):
+                try:
+                    pid = os.fork()
+                except OSError as error:
+                    assert error.errno == errno.EAGAIN
+                    blocked = True
+                    break
+                if pid == 0:
+                    time.sleep(0.5)
+                    os._exit(0)
+                children.append(pid)
+
+            for child in children:
+                os.waitpid(child, 0)
+            assert blocked, "fork attempts were not stopped by the pids limit"
+    """)
+    result = run_tests_in_sandbox(
+        {"test_fork_bomb.py": code},
+        timeout_seconds=15,
+        client=_CLIENT,
+    )
+    assert result.status == "passed", result.message + "\n" + result.output
+    assert result.duration_seconds < 60
+    _assert_no_sandbox_containers()
+
+
+@_DOCKER_SKIP
+def test_sandbox_memory_hog_is_killed_by_memory_limit():
+    code = (
+        "def test_memory_hog():\n"
+        "    memory = bytearray(1024 * 1024 * 1024)\n"
+        "    assert len(memory) == 1024 * 1024 * 1024\n"
+    )
+    result = run_tests_in_sandbox(
+        {"test_memory_hog.py": code},
+        timeout_seconds=15,
+        memory="128m",
+        client=_CLIENT,
+    )
+    assert result.status == "error"
+    assert "memory limit" in result.message.lower() or "oom" in result.message.lower()
+    assert result.duration_seconds < 60
+    _assert_no_sandbox_containers()
+
+
+@_DOCKER_SKIP
+def test_sandbox_truncates_huge_output():
+    code = (
+        "def test_huge_output():\n"
+        "    print('output' * (3 * 1024 * 1024))\n"
+    )
+    result = run_tests_in_sandbox(
+        {"test_huge_output.py": code},
+        timeout_seconds=15,
+        client=_CLIENT,
+    )
+    assert result.status == "passed", result.message
+    assert len(result.output.encode("utf-8")) <= 64 * 1024
+    assert result.duration_seconds < 60
+    _assert_no_sandbox_containers()
+
+
+@_DOCKER_SKIP
+def test_sandbox_cannot_exceed_work_tmpfs_limit():
+    code = textwrap.dedent("""\
+        def test_work_tmpfs_limit():
+            try:
+                with open("/work/oversized.bin", "wb") as target:
+                    block = b"x" * (1024 * 1024)
+                    for _ in range(80):
+                        target.write(block)
+            except OSError:
+                return
+            raise AssertionError("write exceeded the /work tmpfs size limit")
+    """)
+    result = run_tests_in_sandbox(
+        {"test_tmpfs_limit.py": code},
+        timeout_seconds=15,
+        client=_CLIENT,
+    )
+    assert result.status == "passed", result.message + "\n" + result.output
+    assert result.duration_seconds < 60
+    _assert_no_sandbox_containers()

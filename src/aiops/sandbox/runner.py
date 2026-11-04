@@ -319,5 +319,5 @@ def run_tests_in_sandbox(
         if container is not None:
             try:
                 container.remove(force=True)
-            except DockerException:
+            except Exception:
                 pass
