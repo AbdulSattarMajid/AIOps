@@ -187,7 +187,7 @@ def test_identical_storm_runs_one_auto_analysis_and_never_delivers(
     assert len(incidents) == 1
     assert incidents[0].count == 500
     assert len(llm.calls) == analyses == 1
-    assert skipped == 499
+    assert skipped == 0
     assert analysis_results and all(
         "delivery" not in result for result in analysis_results
     )

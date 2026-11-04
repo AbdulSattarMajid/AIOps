@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import uuid
+from dataclasses import asdict
 
 import redis
 from redis.exceptions import RedisError
@@ -97,43 +98,191 @@ def _default_auto_analyzer(incident, limits):
     return main.summarize(state)
 
 
-def _maybe_auto_analyze(processor, incident, client, auto_analyzer):
+def _default_auto_deliverer(summary, incident):
+    from aiops.delivery.github_pr import PyGithubClient, deliver
+
+    token = os.getenv("GITHUB_TOKEN", "")
+    repository = os.getenv("GITHUB_REPO", "")
+    if not token or not repository:
+        return {"status": "refused", "url": None}
+    client = PyGithubClient(token, repository)
+    result = deliver(
+        summary,
+        incident,
+        client,
+        path_prefix=os.getenv("TARGET_REPO_PATH_PREFIX", ""),
+    )
+    return asdict(result)
+
+
+def _pipeline_slack_text(incident, summary, pr_url):
+    from aiops.security.redaction import redact_text
+
+    patch_lines = [
+        line[1:].strip()
+        for line in str(summary.get("patch", "")).splitlines()
+        if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    ]
+    diff_summary = " ".join(patch_lines)[:120] or "no patch"
+    verification = summary.get("verification") or {}
+    if hasattr(verification, "tests_passed"):
+        tests_after = (
+            verification.tests_passed,
+            verification.tests_failed,
+        )
+    elif isinstance(verification, dict):
+        tests_after = (
+            verification.get("tests_passed"),
+            verification.get("tests_failed"),
+        )
+    else:
+        tests_after = (None, None)
+    tests_before = (
+        summary.get("baseline_tests_passed"),
+        summary.get("baseline_tests_failed"),
+    )
+    destination = pr_url or "needs a human"
+    text = (
+        f"Incident {incident.get('id')} {incident.get('service_name', 'unknown')}; "
+        f"{incident.get('error_class', 'unknown error')}; {diff_summary}; "
+        f"tests {tests_before[0]}/{tests_before[1]} -> "
+        f"{tests_after[0]}/{tests_after[1]}; {destination}"
+    )
+    safe_text, _ = redact_text(text)
+    return safe_text.replace("@", "@\u200b")[:1000]
+
+
+def _record_auto_result(processor, incident, status, reason):
+    try:
+        processor.store.record_analysis_result(incident.id, status, reason)
+    except Exception:
+        pass
+
+
+def _maybe_auto_analyze(
+    processor,
+    incident,
+    client,
+    auto_analyzer,
+    auto_deliverer=None,
+    slack_sender=None,
+):
     if os.getenv("AIOPS_AUTO_ANALYZE", "off").lower() != "on":
         return
     limits = RedisLimits(client=client)
     slot = None
     try:
-        slot = limits.acquire_slot("analyses")
-        if slot is None:
+        try:
+            slot = limits.acquire_slot("analyses")
+        except LimitStoreError:
+            _record_auto_result(
+                processor, incident, "skipped",
+                "Automatic analysis skipped; analysis capacity is unavailable.",
+            )
             return
-        if not limits.claim_cooldown(incident.signature):
+        if slot is None:
+            _record_auto_result(
+                processor, incident, "skipped",
+                "Automatic analysis skipped; analysis capacity is full.",
+            )
+            return
+        try:
+            cooldown_claimed = limits.claim_cooldown(incident.signature)
+        except LimitStoreError:
+            _record_auto_result(
+                processor, incident, "skipped",
+                "Automatic analysis skipped; cooldown could not be checked.",
+            )
+            return
+        if not cooldown_claimed:
             limits.record_cooldown_skip()
+            _record_auto_result(
+                processor, incident, "skipped",
+                "Automatic analysis skipped; signature cooldown is active.",
+            )
+            return
+        try:
+            budget_reason = limits.check_token_budget(incident.id)
+        except LimitStoreError:
+            _record_auto_result(
+                processor, incident, "skipped",
+                "Automatic analysis skipped; token budget could not be checked.",
+            )
+            return
+        if budget_reason:
+            _record_auto_result(processor, incident, "skipped", budget_reason)
             return
         limits.record_auto_analysis()
-        result = auto_analyzer(incident, limits)
-        status = str(result.get("status", "escalated"))
-        raw_reason = result.get("reason", "")
-        if raw_reason in {
+        analysis_failed = False
+        try:
+            result = auto_analyzer(incident, limits)
+            status = str(result.get("status", "escalated"))
+        except Exception:
+            result = {"status": "escalated"}
+            status = "escalated"
+            analysis_failed = True
+
+        reason = ""
+        if analysis_failed:
+            reason = "Automatic analysis failed; inspect service health."
+        elif result.get("reason") in {
             "incident token budget reached",
             "daily token budget reached",
         }:
-            reason = raw_reason
+            reason = result["reason"]
         elif status == "escalated":
             reason = "Automatic analysis was escalated."
-        else:
-            reason = ""
-        processor.store.record_analysis_result(
-            incident.id, status, reason
-        )
-    except Exception:
-        try:
-            processor.store.record_analysis_result(
-                incident.id,
-                "escalated",
-                "Automatic analysis failed; inspect service health.",
+
+        delivery = {}
+        deliver_enabled = os.getenv(
+            "AIOPS_AUTO_DELIVER_PR", os.getenv("AUTO_DELIVER_PR", "off")
+        ).lower() == "on"
+        incident_data = {
+            "id": incident.id,
+            "service_name": incident.service_name,
+            "error_class": incident.error_class,
+            "signature": incident.signature,
+            "occurrences": incident.count,
+        }
+        if deliver_enabled and status == "verified":
+            try:
+                delivery = (auto_deliverer or _default_auto_deliverer)(
+                    result, incident_data
+                )
+                if delivery.get("status") not in {"opened", "already_open"}:
+                    reason = "Automatic PR delivery was refused."
+            except Exception:
+                delivery = {}
+                reason = "Automatic PR delivery failed; inspect service health."
+
+        _record_auto_result(processor, incident, status, reason)
+        webhook = os.getenv("SLACK_WEBHOOK_URL", "")
+        if webhook:
+            pr_url = (
+                delivery.get("pr_url") or delivery.get("url")
+                if delivery else None
             )
-        except Exception:
-            pass
+            message = _pipeline_slack_text(incident_data, result, pr_url)
+            try:
+                from aiops.delivery.slack import post_slack
+
+                if slack_sender is not None:
+                    slack_sender(message)
+                elif not post_slack(webhook, message, raise_errors=True):
+                    _record_auto_result(
+                        processor, incident, status,
+                        "Slack notification failed; inspect service health.",
+                    )
+            except Exception:
+                _record_auto_result(
+                    processor, incident, status,
+                    "Slack notification failed; inspect service health.",
+                )
+    except Exception:
+        _record_auto_result(
+            processor, incident, "escalated",
+            "Automatic analysis failed; inspect service health.",
+        )
     finally:
         if slot is not None:
             try:
@@ -155,6 +304,8 @@ def drain_once(
     block_ms: int = 1,
     max_delivery_attempts: int = MAX_DELIVERY_ATTEMPTS,
     auto_analyzer=None,
+    auto_deliverer=None,
+    slack_sender=None,
 ) -> int:
     """Claim stale pending messages, then consume new messages and acknowledge successes."""
     if max_messages < 1:
@@ -206,15 +357,18 @@ def drain_once(
         try:
             payload = json.loads(fields["event"])
             event = LogEvent.model_validate(payload)
-            incident, _ = processor.process(event, event_id=message_id)
+            incident, is_new = processor.process(event, event_id=message_id)
         except Exception:
             continue
-        _maybe_auto_analyze(
-            processor,
-            incident,
-            client,
-            auto_analyzer or _default_auto_analyzer,
-        )
+        if is_new:
+            _maybe_auto_analyze(
+                processor,
+                incident,
+                client,
+                auto_analyzer or _default_auto_analyzer,
+                auto_deliverer=auto_deliverer,
+                slack_sender=slack_sender,
+            )
         _ack_and_delete(client, stream_name, group_name, message_id)
         handled += 1
     return handled

@@ -200,7 +200,7 @@ def test_auto_analyze_off_and_on_with_cooldown_and_no_delivery(monkeypatch):
     assert len(llm.calls) == 1
     assert len(results) == 1
     assert "delivery" not in results[0]
-    assert limits.auto_analysis_stats() == (1, 99)
+    assert limits.auto_analysis_stats() == (1, 0)
     incident = next(iter(engine.incidents.values()))
     assert incident.count == 100
 
