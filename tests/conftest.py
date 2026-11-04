@@ -6,12 +6,14 @@ import os
 import secrets
 from typing import Generator
 
+import fakeredis
 import pytest
 from fastapi.testclient import TestClient
 
 from aiops.api import main
 from aiops.security.auth import hash_api_key
 from aiops.security.ratelimit import default_limiter
+from aiops.storage import redis_store
 
 # Generate a consistent test API key and hash for test sessions
 TEST_API_KEY = "test-aiops-key-" + "valid-for-tests-secret"
@@ -40,6 +42,16 @@ def reset_rate_limiter_and_auth():
     default_limiter.reset()
 
 
+@pytest.fixture(autouse=True)
+def reset_redis(monkeypatch):
+    client = fakeredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(redis_store, "get_redis", lambda: client)
+    monkeypatch.setenv("AIOPS_INGEST_MODE", "inline")
+    monkeypatch.setenv("AIOPS_AUTO_ANALYZE", "off")
+    yield
+    client.flushdb()
+
+
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     """Return headers with the valid test API key."""
@@ -51,4 +63,3 @@ def authed_client() -> Generator[TestClient, None, None]:
     """TestClient preconfigured with valid X-API-Key header."""
     with TestClient(main.app, headers={"X-API-Key": TEST_API_KEY}) as client:
         yield client
-

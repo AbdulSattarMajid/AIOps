@@ -15,15 +15,25 @@ from aiops.dedup.engine import DedupEngine
 from aiops.delivery.github_pr import DeliveryError, PyGithubClient, deliver
 from aiops.delivery.slack import build_slack_text, post_slack
 from aiops.ingest.schemas import LogEvent
+from aiops.limits import LimitStoreError, RedisLimits
 from aiops.rag.store import RunbookStore
 from aiops.sandbox.app_sandbox import AppSandbox
 from aiops.sandbox.runner import is_docker_available
 from aiops.security.auth import get_configured_hashes, redact_headers, verify_api_key
+from aiops.security.redaction import redact_log_event
 from aiops.security.ratelimit import (
     RateLimiter,
     default_limiter,
     get_rate_limit_config,
 )
+from aiops.storage.redis_store import (
+    DEAD_LETTER_STREAM,
+    QUEUE_STREAM,
+    RedisStoreError,
+    enqueue_event,
+    queue_stats,
+)
+from aiops.storage import redis_store
 
 load_dotenv()
 
@@ -247,6 +257,41 @@ def get_github(deliver: bool = Query(False)):
         raise HTTPException(status_code=503, detail=str(error))
 
 
+def get_limits():
+    try:
+        return RedisLimits(client=redis_store.get_redis())
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis storm-protection limits are unavailable.",
+            headers={"Retry-After": "5"},
+        ) from None
+
+
+def acquire_analysis_slot(limits: RedisLimits = Depends(get_limits)):
+    try:
+        slot = limits.acquire_slot("analyses")
+    except LimitStoreError:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis analysis capacity is unavailable.",
+            headers={"Retry-After": "5"},
+        ) from None
+    if slot is None:
+        raise HTTPException(
+            status_code=429,
+            detail="Analysis capacity is full; retry later.",
+            headers={"Retry-After": "5"},
+        )
+    try:
+        yield limits, slot
+    finally:
+        try:
+            limits.release_slot("analyses", slot)
+        except LimitStoreError:
+            pass
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -254,7 +299,33 @@ def health():
 
 @app.post("/api/v1/telemetry/logs")
 def ingest_log(event: LogEvent):
-    incident, is_new = engine.process(event)
+    if os.getenv("AIOPS_INGEST_MODE", "queue").lower() != "inline":
+        redacted_event, _ = redact_log_event(event)
+        try:
+            event_id = enqueue_event(
+                redacted_event.model_dump(mode="json"),
+                stream=QUEUE_STREAM,
+            )
+        except RedisStoreError as error:
+            raise HTTPException(
+                status_code=503,
+                detail=str(error),
+                headers={"Retry-After": "5"},
+            ) from error
+        return JSONResponse(
+            status_code=202,
+            content={"status": "accepted", "event_id": event_id},
+        )
+
+    # Inline mode is for tests and local development; production defaults to queue.
+    try:
+        incident, is_new = engine.process(event)
+    except RedisStoreError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+            headers={"Retry-After": "5"},
+        ) from error
     return {
         "incident_id": incident.id,
         "is_new": is_new,
@@ -262,18 +333,42 @@ def ingest_log(event: LogEvent):
     }
 
 
+@app.get("/api/v1/queue/stats")
+def get_queue_stats():
+    try:
+        return queue_stats(
+            stream=QUEUE_STREAM,
+            dead_letter_stream=DEAD_LETTER_STREAM,
+        )
+    except RedisStoreError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=str(error),
+            headers={"Retry-After": "5"},
+        ) from error
+
+
 @app.get("/api/v1/incidents")
 def list_incidents():
-    return [asdict(i) for i in engine.incidents.values()]
+    try:
+        return [asdict(i) for i in engine.incidents.values()]
+    except RedisStoreError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
 
 
 @app.post("/api/v1/incidents/{incident_id}/analyze")
-def analyze_incident(incident_id: int, llm=Depends(get_llm),
+def analyze_incident(incident_id: int,
+                     slot_info=Depends(acquire_analysis_slot),
+                     llm=Depends(get_llm),
                      store=Depends(get_store),
                      sandbox=Depends(get_sandbox),
                      deliver_requested: bool = Query(False, alias="deliver"),
                      github=Depends(get_github)):
-    incident = engine.incidents.get(incident_id)
+    limits, _slot = slot_info
+    try:
+        incident = engine.get_incident(incident_id)
+    except RedisStoreError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
     state = run_agent(
@@ -284,6 +379,8 @@ def analyze_incident(incident_id: int, llm=Depends(get_llm),
         repo_root=REPO_ROOT,
         incident_id=incident.id,
         sandbox=sandbox,
+        limits=limits,
+        signature=incident.signature,
     )
     response = summarize(state)
     if deliver_requested:
