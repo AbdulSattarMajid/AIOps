@@ -1,12 +1,13 @@
 import hashlib
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 import numpy as np
 
 from aiops.dedup.normalize import normalize_trace
 from aiops.ingest.schemas import LogEvent
+from aiops.security.redaction import merge_findings, redact_log_event
 
 VECTOR_SIZE = 256
 
@@ -39,6 +40,7 @@ class Incident:
     last_seen: str
     count: int
     sample_trace: str
+    redaction: Dict[str, int] = field(default_factory=dict)
 
 
 class DedupEngine:
@@ -52,6 +54,7 @@ class DedupEngine:
 
     def process(self, event: LogEvent) -> Tuple[Incident, bool]:
         """Returns (incident, is_new). is_new is False when this error was seen before."""
+        event, findings = redact_log_event(event)
         normalized = normalize_trace(f"{event.error_class} {event.stack_trace}")
         signature = hashlib.sha256(
             f"{event.service_name}|{normalized}".encode()
@@ -59,7 +62,7 @@ class DedupEngine:
 
         # 1) Exact match: same normalized error seen before
         if signature in self._by_signature:
-            return self._bump(self._by_signature[signature], event), False
+            return self._bump(self._by_signature[signature], event, findings), False
 
         # 2) Near match: very similar error from the same service
         vector = text_to_vector(normalized)
@@ -71,7 +74,7 @@ class DedupEngine:
             if scores[best] >= self.threshold:
                 incident_id = candidates[best][0]
                 self._by_signature[signature] = incident_id
-                return self._bump(incident_id, event), False
+                return self._bump(incident_id, event, findings), False
 
         # 3) Brand new error
         incident = Incident(
@@ -83,6 +86,7 @@ class DedupEngine:
             last_seen=event.timestamp,
             count=1,
             sample_trace=event.stack_trace,
+            redaction=dict(findings),
         )
         self._next_id += 1
         self.incidents[incident.id] = incident
@@ -90,8 +94,11 @@ class DedupEngine:
         self._vectors.setdefault(event.service_name, []).append((incident.id, vector))
         return incident, True
 
-    def _bump(self, incident_id: int, event: LogEvent) -> Incident:
+    def _bump(self, incident_id: int, event: LogEvent,
+              findings: Dict[str, int] | None = None) -> Incident:
         incident = self.incidents[incident_id]
         incident.count += 1
         incident.last_seen = event.timestamp
+        if findings:
+            incident.redaction = merge_findings(incident.redaction, findings)
         return incident

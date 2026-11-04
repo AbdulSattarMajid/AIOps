@@ -168,16 +168,116 @@ def test_two_file_diff_is_rejected():
 
 
 def test_multiple_hunks_apply_in_order():
+    # Use a non-email replacement so the Week-5A secret scanner does
+    # not flag the added line; this test is about hunk ordering only.
     diff = """--- a/users.py
 +++ b/users.py
 @@ -3 +3 @@
 -USERS = {1: "ana@example.com"}
-+USERS = {1: "updated@example.com"}
++USERS = {1: "user-ana"}
 @@ -19 +19 @@
 -    return user.email
 +    return user.email.lower()
 """
     result = validate_diff(diff, "users.py", SOURCE)
     assert result.ok
-    assert 'USERS = {1: "updated@example.com"}' in result.new_source
+    assert 'USERS = {1: "user-ana"}' in result.new_source
     assert "return user.email.lower()" in result.new_source
+
+
+# ---------------------------------------------------------------------------
+# Secret-in-patch tests (Week 5A)
+# ---------------------------------------------------------------------------
+
+def _fake_secret(prefix, fill="A", length=24):
+    """Build a secret-looking value at runtime so the repo scanner stays clean."""
+    return prefix + fill * length
+
+
+def test_patch_adding_hardcoded_groq_key_is_rejected():
+    """A diff that adds a Groq API key on a '+' line must be rejected outright."""
+    groq = _fake_secret("gsk_")
+    diff = (
+        "--- a/users.py\n+++ b/users.py\n@@ -17,3 +17,4 @@\n"
+        " def get_user_email(user_id):\n"
+        "     user = find_user(user_id)\n"
+        f"+    key = \"{groq}\"\n"
+        "     return user.email\n"
+    )
+    result = validate_diff(diff, "users.py", SOURCE, FUNCTION_RANGE)
+    assert not result.ok
+    assert "secret" in result.error.lower()
+    assert groq not in result.error          # value must not leak into the error message
+    assert result.new_source is None         # new_source is never produced
+
+
+def test_patch_adding_github_token_is_rejected():
+    ghp = _fake_secret("ghp_")
+    diff = (
+        "--- a/users.py\n+++ b/users.py\n@@ -17,3 +17,4 @@\n"
+        " def get_user_email(user_id):\n"
+        "     user = find_user(user_id)\n"
+        f"+    token = \"{ghp}\"\n"
+        "     return user.email\n"
+    )
+    result = validate_diff(diff, "users.py", SOURCE)
+    assert not result.ok
+    assert "secret" in result.error.lower()
+    assert ghp not in result.error
+
+
+def test_patch_adding_aws_key_is_rejected():
+    aws = "AKIA" + "B" * 16
+    diff = (
+        "--- a/users.py\n+++ b/users.py\n@@ -17,3 +17,4 @@\n"
+        " def get_user_email(user_id):\n"
+        "     user = find_user(user_id)\n"
+        f"+    creds = \"{aws}\"\n"
+        "     return user.email\n"
+    )
+    result = validate_diff(diff, "users.py", SOURCE)
+    assert not result.ok
+    assert "secret" in result.error.lower()
+    assert aws not in result.error
+
+
+def test_patch_adding_quoted_password_is_rejected():
+    """key='value' on an added line is caught by the source_secret_findings scanner."""
+    diff = (
+        "--- a/users.py\n+++ b/users.py\n@@ -17,3 +17,4 @@\n"
+        " def get_user_email(user_id):\n"
+        "     user = find_user(user_id)\n"
+        "+    password = \"super" + "secret99\"\n"
+        "     return user.email\n"
+    )
+    result = validate_diff(diff, "users.py", SOURCE)
+    assert not result.ok
+    assert "secret" in result.error.lower()
+
+
+def test_normal_patch_without_secrets_is_still_accepted():
+    """Sanity check: the scanner must not introduce false positives on clean diffs."""
+    result = validate_diff(GOOD_DIFF, "users.py", SOURCE, FUNCTION_RANGE)
+    assert result.ok
+    assert result.new_source is not None
+
+
+def test_secret_on_removed_line_does_not_block_patch():
+    """Removing a secret-looking line is fine — we only block *adding* one."""
+    groq = _fake_secret("gsk_", "C")
+    # Inject the secret into SOURCE as an existing line so the diff can remove it
+    patched_source = SOURCE.replace(
+        "    return user.email",
+        f'    key = "{groq}"  # existing secret\n    return user.email',
+        1,
+    )
+    diff = (
+        "--- a/users.py\n+++ b/users.py\n@@ -17,4 +17,3 @@\n"
+        " def get_user_email(user_id):\n"
+        "     user = find_user(user_id)\n"
+        f"-    key = \"{groq}\"  # existing secret\n"
+        "     return user.email\n"
+    )
+    result = validate_diff(diff, "users.py", patched_source)
+    assert result.ok, result.error
+    assert groq not in result.new_source

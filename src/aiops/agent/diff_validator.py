@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+from aiops.security.redaction import source_secret_findings
+
 
 class DiffError(ValueError):
     pass
@@ -33,6 +35,11 @@ class _FileDiff:
 
 
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@")
+_DANGEROUS_ADDED_PATTERNS = (
+    re.compile(r"\b(?:import|from)\s+(?:requests|urllib|socket|subprocess)\b"),
+    re.compile(r"\b(?:requests|urllib|socket|subprocess)\s*\."),
+    re.compile(r"\bos\s*\.\s*system\s*\("),
+)
 _DIFF_INSTRUCTIONS = (
     "After the '+++ b/<file>' line, each section must start with a line like "
     "'@@ -17,3 +17,5 @@' and every following line must start with a space "
@@ -231,6 +238,38 @@ def _apply_hunks(source: str, hunks: List[_Hunk],
     return result
 
 
+def _check_added_lines_for_secrets(hunks: List[_Hunk]) -> None:
+    """Reject the patch if any added line contains a secret-looking value.
+
+    We scan only the *added* lines (prefix '+') so that existing secrets
+    already in the file do not block the diff — they are caught separately
+    by the source-code scan in graph.py before the LLM is even called.
+    """
+    added_text = "\n".join(text for kind, text in
+                           (line for hunk in hunks for line in hunk.lines)
+                           if kind == "+")
+    if not added_text:
+        return
+    findings = source_secret_findings(added_text)
+    if findings:
+        kinds = ", ".join(sorted(findings))
+        raise DiffError(
+            f"Patch adds secret-looking value(s) ({kinds}); rejecting to "
+            "prevent credentials from entering the repository."
+        )
+
+
+def _check_added_lines_for_dangerous_calls(hunks: List[_Hunk]) -> None:
+    for kind, text in (line for hunk in hunks for line in hunk.lines):
+        if kind == "+" and any(
+            pattern.search(text) for pattern in _DANGEROUS_ADDED_PATTERNS
+        ):
+            raise DiffError(
+                "Patch adds a network or process execution call; rejecting "
+                "the added line."
+            )
+
+
 def validate_diff(reply: str, rel_path: str, source: str,
                   func_range: Optional[Tuple[int, int]] = None
                   ) -> ValidationResult:
@@ -253,6 +292,10 @@ def validate_diff(reply: str, rel_path: str, source: str,
                 f"Diff file paths must both be {rel_path!r}; "
                 f"got {file_diff.old_path!r} and {file_diff.new_path!r}."
             )
+        # Reject before applying: a patch that adds a hardcoded secret must
+        # never produce a new_source that we then send to the sandbox or repo.
+        _check_added_lines_for_secrets(file_diff.hunks)
+        _check_added_lines_for_dangerous_calls(file_diff.hunks)
         new_source = _apply_hunks(source, file_diff.hunks, func_range)
         if new_source == source:
             raise DiffError("Diff does not change the source.")

@@ -4,8 +4,9 @@ from fastapi.testclient import TestClient
 from aiops.api import main
 from aiops.dedup.engine import DedupEngine
 from aiops.dedup.normalize import normalize_trace
+from tests.conftest import TEST_API_KEY
 
-client = TestClient(main.app)
+client = TestClient(main.app, headers={"X-API-Key": TEST_API_KEY})
 
 
 @pytest.fixture(autouse=True)
