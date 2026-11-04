@@ -10,6 +10,7 @@ chroma_data/
 .vscode/
 .env.*
 !.env.example
+.streamlit/secrets.toml
 .mypy_cache/
 .coverage
 htmlcov/
