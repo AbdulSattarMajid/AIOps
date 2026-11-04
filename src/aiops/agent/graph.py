@@ -45,6 +45,27 @@ class IncidentState(TypedDict, total=False):
     sandbox_ok: bool
     patch_source: str
     last_test_output: str
+    test_source: str
+    baseline_failed_tests: List[str]
+    baseline_test_output: str
+
+
+def _related_test_source(state: IncidentState) -> str:
+    rel_path = Path(state.get("rel_path", ""))
+    if rel_path.is_absolute() or ".." in rel_path.parts:
+        return ""
+    try:
+        root = Path(state.get("repo_root", "")).resolve()
+        test_path = (
+            root / rel_path.parent / f"test_{rel_path.stem}.py"
+        ).resolve()
+        test_path.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return ""
+    try:
+        return test_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
@@ -174,9 +195,15 @@ def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
                 ),
                 "sandbox_ok": False,
             }
+        test_source = _related_test_source(state)
         return {
             "baseline_result": baseline,
             "sandbox_ok": True,
+            **({
+                "test_source": test_source,
+                "baseline_failed_tests": list(baseline.failed_tests),
+                "baseline_test_output": baseline.output,
+            } if test_source else {}),
         }
 
     def generate_patch(state: IncidentState) -> Dict:
