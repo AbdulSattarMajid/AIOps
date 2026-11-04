@@ -6,7 +6,11 @@ from langgraph.graph import END, START, StateGraph
 
 from aiops.agent.diff_validator import validate_diff
 from aiops.agent.prompts import SYSTEM_PROMPT, build_user_prompt
-from aiops.context.extract import extract_function, resolve_repo_path
+from aiops.context.extract import (
+    extract_function,
+    resolve_repo_path,
+    select_application_frame,
+)
 from aiops.context.stacktrace import parse_python_traceback
 from aiops.limits import LimitStoreError, RedisLimits
 from aiops.sandbox.evaluate import Verification, evaluate_verification
@@ -72,16 +76,23 @@ def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
     def analyze_error(state: IncidentState) -> Dict:
         trace, _ = redact_text(state.get("trace", ""))
         parsed = parse_python_traceback(trace)
-        frame = parsed.crash_frame
+        path_prefix = state.get("path_prefix", "/app/")
+        repo_root = state.get("repo_root", "")
+        frame = select_application_frame(
+            parsed.frames, repo_root, path_prefix
+        )
         if frame is None:
             return {
                 "signature": state.get("signature") or parsed.signature,
                 "status": "escalated",
-                "reason": "No Python traceback frame was found in the incident.",
+                "reason": (
+                    "No Python traceback frame was found in the incident."
+                    if not parsed.frames
+                    else "no application frame found in the traceback"
+                ),
             }
-        path_prefix = state.get("path_prefix", "/app/")
         path = resolve_repo_path(
-            frame.file, state.get("repo_root", ""), path_prefix
+            frame.file, repo_root, path_prefix
         )
         if path is None:
             return {
