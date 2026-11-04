@@ -42,6 +42,12 @@ class DedupStore(Protocol):
 
     def list_incidents(self) -> List[Dict]: ...
 
+    def record_analysis_result(
+        self, incident_id: int, status: str, reason: str
+    ) -> None: ...
+
+    def get_analysis_result(self, incident_id: int) -> Optional[Dict]: ...
+
 
 @lru_cache(maxsize=8)
 def _redis_for_url(url: str):
@@ -90,6 +96,9 @@ class RedisStore:
 
     def _incident_key(self, incident_id: int) -> str:
         return f"{self.prefix}incident:{incident_id}"
+
+    def _analysis_key(self, incident_id: int) -> str:
+        return f"{self.prefix}analysis-result:{incident_id}"
 
     def _signature_key(self, signature: str) -> str:
         return f"{self.prefix}signature:{signature}"
@@ -293,6 +302,29 @@ class RedisStore:
                 "Redis storage is unavailable; incident state cannot be read."
             ) from None
 
+    def record_analysis_result(
+        self, incident_id: int, status: str, reason: str
+    ) -> None:
+        try:
+            self._client().set(
+                self._analysis_key(incident_id),
+                json.dumps({"status": status, "reason": reason}),
+                ex=self.ttl_seconds,
+            )
+        except RedisError:
+            raise RedisStoreError(
+                "Redis storage is unavailable; analysis result was not saved."
+            ) from None
+
+    def get_analysis_result(self, incident_id: int) -> Optional[Dict]:
+        try:
+            raw = self._client().get(self._analysis_key(incident_id))
+            return json.loads(raw) if raw is not None else None
+        except RedisError:
+            raise RedisStoreError(
+                "Redis storage is unavailable; analysis result cannot be read."
+            ) from None
+
 
 class InMemoryStore:
     """Process-local test store; production defaults to RedisStore."""
@@ -304,6 +336,7 @@ class InMemoryStore:
         self._vectors: Dict[str, List[Dict]] = {}
         self._next_id = 1
         self._processed: Dict[str, int] = {}
+        self._analysis_results: Dict[int, Dict] = {}
         self._lock = threading.RLock()
 
     def process(
@@ -366,6 +399,20 @@ class InMemoryStore:
     def list_incidents(self) -> List[Dict]:
         with self._lock:
             return [dict(item) for item in self._incidents.values()]
+
+    def record_analysis_result(
+        self, incident_id: int, status: str, reason: str
+    ) -> None:
+        with self._lock:
+            self._analysis_results[incident_id] = {
+                "status": status,
+                "reason": reason,
+            }
+
+    def get_analysis_result(self, incident_id: int) -> Optional[Dict]:
+        with self._lock:
+            result = self._analysis_results.get(incident_id)
+            return dict(result) if result is not None else None
 
 
 def _stream_max_len() -> int:

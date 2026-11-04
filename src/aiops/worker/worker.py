@@ -11,6 +11,7 @@ from redis.exceptions import RedisError
 
 from aiops.dedup.engine import DedupEngine
 from aiops.ingest.schemas import LogEvent
+from aiops.limits import LimitStoreError, RedisLimits
 from aiops.storage.redis_store import (
     CONSUMER_GROUP,
     DEAD_LETTER_STREAM,
@@ -79,6 +80,68 @@ def _ack_and_delete(client, stream_name: str, group_name: str, message_id: str):
     pipe.execute()
 
 
+def _default_auto_analyzer(incident, limits):
+    from aiops.api import main
+
+    state = main.run_agent(
+        main.get_llm(),
+        main.get_store(),
+        trace=incident.sample_trace,
+        service_name=incident.service_name,
+        repo_root=main.REPO_ROOT,
+        incident_id=incident.id,
+        sandbox=main.get_sandbox(),
+        limits=limits,
+        signature=incident.signature,
+    )
+    return main.summarize(state)
+
+
+def _maybe_auto_analyze(processor, incident, client, auto_analyzer):
+    if os.getenv("AIOPS_AUTO_ANALYZE", "off").lower() != "on":
+        return
+    limits = RedisLimits(client=client)
+    slot = None
+    try:
+        slot = limits.acquire_slot("analyses")
+        if slot is None:
+            return
+        if not limits.claim_cooldown(incident.signature):
+            limits.record_cooldown_skip()
+            return
+        limits.record_auto_analysis()
+        result = auto_analyzer(incident, limits)
+        status = str(result.get("status", "escalated"))
+        raw_reason = result.get("reason", "")
+        if raw_reason in {
+            "incident token budget reached",
+            "daily token budget reached",
+        }:
+            reason = raw_reason
+        elif status == "escalated":
+            reason = "Automatic analysis was escalated."
+        else:
+            reason = ""
+        processor.store.record_analysis_result(
+            incident.id, status, reason
+        )
+    except Exception:
+        try:
+            processor.store.record_analysis_result(
+                incident.id,
+                "escalated",
+                "Automatic analysis failed; inspect service health.",
+            )
+        except Exception:
+            pass
+    finally:
+        if slot is not None:
+            try:
+                limits.release_slot("analyses", slot)
+            except LimitStoreError:
+                pass
+
+
 def drain_once(
     client,
     max_messages: int,
@@ -91,6 +154,7 @@ def drain_once(
     min_idle_ms: int = RECLAIM_IDLE_MS,
     block_ms: int = 1,
     max_delivery_attempts: int = MAX_DELIVERY_ATTEMPTS,
+    auto_analyzer=None,
 ) -> int:
     """Claim stale pending messages, then consume new messages and acknowledge successes."""
     if max_messages < 1:
@@ -142,9 +206,15 @@ def drain_once(
         try:
             payload = json.loads(fields["event"])
             event = LogEvent.model_validate(payload)
-            processor.process(event, event_id=message_id)
+            incident, _ = processor.process(event, event_id=message_id)
         except Exception:
             continue
+        _maybe_auto_analyze(
+            processor,
+            incident,
+            client,
+            auto_analyzer or _default_auto_analyzer,
+        )
         _ack_and_delete(client, stream_name, group_name, message_id)
         handled += 1
     return handled

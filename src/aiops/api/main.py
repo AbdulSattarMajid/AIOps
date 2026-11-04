@@ -15,6 +15,7 @@ from aiops.dedup.engine import DedupEngine
 from aiops.delivery.github_pr import DeliveryError, PyGithubClient, deliver
 from aiops.delivery.slack import build_slack_text, post_slack
 from aiops.ingest.schemas import LogEvent
+from aiops.limits import LimitStoreError, RedisLimits
 from aiops.rag.store import RunbookStore
 from aiops.sandbox.app_sandbox import AppSandbox
 from aiops.sandbox.runner import is_docker_available
@@ -32,6 +33,7 @@ from aiops.storage.redis_store import (
     enqueue_event,
     queue_stats,
 )
+from aiops.storage import redis_store
 
 load_dotenv()
 
@@ -255,6 +257,41 @@ def get_github(deliver: bool = Query(False)):
         raise HTTPException(status_code=503, detail=str(error))
 
 
+def get_limits():
+    try:
+        return RedisLimits(client=redis_store.get_redis())
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis storm-protection limits are unavailable.",
+            headers={"Retry-After": "5"},
+        ) from None
+
+
+def acquire_analysis_slot(limits: RedisLimits = Depends(get_limits)):
+    try:
+        slot = limits.acquire_slot("analyses")
+    except LimitStoreError:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis analysis capacity is unavailable.",
+            headers={"Retry-After": "5"},
+        ) from None
+    if slot is None:
+        raise HTTPException(
+            status_code=429,
+            detail="Analysis capacity is full; retry later.",
+            headers={"Retry-After": "5"},
+        )
+    try:
+        yield limits, slot
+    finally:
+        try:
+            limits.release_slot("analyses", slot)
+        except LimitStoreError:
+            pass
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -320,11 +357,14 @@ def list_incidents():
 
 
 @app.post("/api/v1/incidents/{incident_id}/analyze")
-def analyze_incident(incident_id: int, llm=Depends(get_llm),
+def analyze_incident(incident_id: int,
+                     slot_info=Depends(acquire_analysis_slot),
+                     llm=Depends(get_llm),
                      store=Depends(get_store),
                      sandbox=Depends(get_sandbox),
                      deliver_requested: bool = Query(False, alias="deliver"),
                      github=Depends(get_github)):
+    limits, _slot = slot_info
     try:
         incident = engine.get_incident(incident_id)
     except RedisStoreError as error:
@@ -339,6 +379,8 @@ def analyze_incident(incident_id: int, llm=Depends(get_llm),
         repo_root=REPO_ROOT,
         incident_id=incident.id,
         sandbox=sandbox,
+        limits=limits,
+        signature=incident.signature,
     )
     response = summarize(state)
     if deliver_requested:

@@ -8,6 +8,7 @@ from aiops.agent.diff_validator import validate_diff
 from aiops.agent.prompts import SYSTEM_PROMPT, build_user_prompt
 from aiops.context.extract import extract_function, resolve_repo_path
 from aiops.context.stacktrace import parse_python_traceback
+from aiops.limits import LimitStoreError, RedisLimits
 from aiops.sandbox.evaluate import Verification, evaluate_verification
 from aiops.sandbox.runner import SandboxResult
 from aiops.security.redaction import redact_text, source_secret_findings
@@ -46,14 +47,14 @@ class IncidentState(TypedDict, total=False):
     last_test_output: str
 
 
-def build_graph(llm, store, sandbox=None):
+def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
     def analyze_error(state: IncidentState) -> Dict:
         trace, _ = redact_text(state.get("trace", ""))
         parsed = parse_python_traceback(trace)
         frame = parsed.crash_frame
         if frame is None:
             return {
-                "signature": parsed.signature,
+                "signature": state.get("signature") or parsed.signature,
                 "status": "escalated",
                 "reason": "No Python traceback frame was found in the incident.",
             }
@@ -63,7 +64,7 @@ def build_graph(llm, store, sandbox=None):
         )
         if path is None:
             return {
-                "signature": parsed.signature,
+                "signature": state.get("signature") or parsed.signature,
                 "status": "escalated",
                 "reason": (
                     "The traceback file is missing, outside the repository, "
@@ -75,7 +76,7 @@ def build_graph(llm, store, sandbox=None):
         )
         if context is None:
             return {
-                "signature": parsed.signature,
+                "signature": state.get("signature") or parsed.signature,
                 "status": "escalated",
                 "reason": "Could not find a Python function containing the crash line.",
             }
@@ -84,7 +85,7 @@ def build_graph(llm, store, sandbox=None):
             rel_path = path.relative_to(root).as_posix()
         except ValueError:
             return {
-                "signature": parsed.signature,
+                "signature": state.get("signature") or parsed.signature,
                 "status": "escalated",
                 "reason": "The traceback file is outside the configured repository.",
             }
@@ -96,7 +97,7 @@ def build_graph(llm, store, sandbox=None):
         )
         if source_secret_findings(context.source):
             return {
-                "signature": parsed.signature,
+                "signature": state.get("signature") or parsed.signature,
                 "rel_path": rel_path,
                 "function_name": context.function,
                 "function_range": (context.start_line, context.end_line),
@@ -105,7 +106,7 @@ def build_graph(llm, store, sandbox=None):
                 "trace": trace,
             }
         return {
-            "signature": parsed.signature,
+            "signature": state.get("signature") or parsed.signature,
             "rel_path": rel_path,
             "function_name": context.function,
             "function_range": (context.start_line, context.end_line),
@@ -133,16 +134,35 @@ def build_graph(llm, store, sandbox=None):
         return {"runbooks": cleaned}
 
     def baseline_tests(state: IncidentState) -> Dict:
+        slot = None
+        if limits is not None:
+            try:
+                slot = limits.acquire_slot("sandboxes")
+            except LimitStoreError:
+                slot = None
+            if slot is None:
+                return {
+                    "verification": Verification(
+                        "unavailable",
+                        message="Sandbox concurrency capacity is unavailable.",
+                    ),
+                    "sandbox_ok": False,
+                }
         try:
             baseline = sandbox.baseline()
-        except Exception as error:
-            message = f"{type(error).__name__}: {error}"
+        except Exception:
             return {
                 "verification": Verification(
-                    "unavailable", message=message
+                    "unavailable", message="Sandbox execution failed."
                 ),
                 "sandbox_ok": False,
             }
+        finally:
+            if slot is not None:
+                try:
+                    limits.release_slot("sandboxes", slot)
+                except LimitStoreError:
+                    pass
         if baseline.status in ("error", "timeout"):
             message = baseline.message or (
                 "Baseline sandbox tests " + baseline.status + "."
@@ -162,23 +182,52 @@ def build_graph(llm, store, sandbox=None):
     def generate_patch(state: IncidentState) -> Dict:
         attempt = state.get("attempt", 0) + 1
         updated = {"attempt": attempt}
+        incident_id = state.get("incident_id", 0)
+        if limits is not None:
+            try:
+                budget_reason = limits.check_token_budget(incident_id)
+            except LimitStoreError:
+                return {
+                    "attempt": attempt,
+                    "status": "escalated",
+                    "reason": "Token budget could not be checked; analysis stopped.",
+                }
+            if budget_reason:
+                return {
+                    "attempt": attempt,
+                    "status": "escalated",
+                    "reason": budget_reason,
+                }
         try:
             reply = llm.complete(
                 SYSTEM_PROMPT,
                 build_user_prompt(state),
             )
-        except Exception as error:
+        except Exception:
             updated.update({
                 "status": "escalated",
-                "reason": f"AI call failed: {type(error).__name__}: {error}",
+                "reason": "AI call failed; analysis stopped.",
             })
             return updated
         text = reply.text
+        used_tokens = reply.input_tokens + reply.output_tokens
+        if limits is not None:
+            try:
+                limits.record_tokens(incident_id, used_tokens)
+            except LimitStoreError:
+                return {
+                    "attempt": attempt,
+                    "status": "escalated",
+                    "reason": (
+                        "Token usage could not be recorded; analysis stopped."
+                    ),
+                    "tokens_used": state.get("tokens_used", 0) + used_tokens,
+                }
         updated.update({
             "last_reply": text,
             "model": reply.model,
             "tokens_used": state.get("tokens_used", 0)
-            + reply.input_tokens + reply.output_tokens,
+            + used_tokens,
         })
         return updated
 
@@ -229,12 +278,33 @@ def build_graph(llm, store, sandbox=None):
         return updated
 
     def verify_in_sandbox(state: IncidentState) -> Dict:
+        slot = None
+        if limits is not None:
+            try:
+                slot = limits.acquire_slot("sandboxes")
+            except LimitStoreError:
+                slot = None
+            if slot is None:
+                after = SandboxResult(
+                    status="error",
+                    exit_code=None,
+                    output="",
+                    duration_seconds=0.0,
+                    tests_passed=None,
+                    tests_failed=None,
+                    message="Sandbox concurrency capacity is unavailable.",
+                )
+            else:
+                after = None
+        else:
+            after = None
         try:
-            after = sandbox.verify(
-                state.get("rel_path", ""),
-                state.get("patch_source", ""),
-            )
-        except Exception as error:
+            if after is None:
+                after = sandbox.verify(
+                    state.get("rel_path", ""),
+                    state.get("patch_source", ""),
+                )
+        except Exception:
             after = SandboxResult(
                 status="error",
                 exit_code=None,
@@ -242,8 +312,14 @@ def build_graph(llm, store, sandbox=None):
                 duration_seconds=0.0,
                 tests_passed=None,
                 tests_failed=None,
-                message=f"{type(error).__name__}: {error}",
+                message="Sandbox execution failed.",
             )
+        finally:
+            if slot is not None:
+                try:
+                    limits.release_slot("sandboxes", slot)
+                except LimitStoreError:
+                    pass
         verification = evaluate_verification(
             state["baseline_result"],
             after,
@@ -383,11 +459,13 @@ def build_graph(llm, store, sandbox=None):
 def run_agent(llm, store, trace: str, service_name: str,
               repo_root: str, incident_id: int = 0,
               path_prefix: str = "/app/", max_retries: int = 3,
-              sandbox=None) -> Dict:
-    graph = build_graph(llm, store, sandbox=sandbox)
+              sandbox=None, limits: RedisLimits | None = None,
+              signature: str = "") -> Dict:
+    graph = build_graph(llm, store, sandbox=sandbox, limits=limits)
     clean_trace, _ = redact_text(trace or "")
     initial: IncidentState = {
         "incident_id": incident_id,
+        "signature": signature,
         "service_name": service_name,
         "trace": clean_trace,
         "repo_root": repo_root,
