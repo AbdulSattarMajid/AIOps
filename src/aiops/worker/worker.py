@@ -10,6 +10,11 @@ from dataclasses import asdict
 import redis
 from redis.exceptions import RedisError
 
+from aiops.context.github_source import (
+    GitHubSourceError,
+    repository_source,
+    uses_github_source,
+)
 from aiops.dedup.engine import DedupEngine
 from aiops.ingest.schemas import LogEvent
 from aiops.limits import LimitStoreError, RedisLimits
@@ -20,7 +25,6 @@ from aiops.storage.redis_store import (
     RedisStore,
     get_redis,
 )
-
 
 RECLAIM_IDLE_MS = int(os.getenv("STREAM_RECLAIM_IDLE_MS", "60000"))
 MAX_DELIVERY_ATTEMPTS = int(os.getenv("STREAM_MAX_DELIVERY_ATTEMPTS", "5"))
@@ -84,18 +88,33 @@ def _ack_and_delete(client, stream_name: str, group_name: str, message_id: str):
 def _default_auto_analyzer(incident, limits):
     from aiops.api import main
 
-    state = main.run_agent(
-        main.get_llm(),
-        main.get_store(),
-        trace=incident.sample_trace,
-        service_name=incident.service_name,
-        repo_root=main.REPO_ROOT,
-        incident_id=incident.id,
-        sandbox=main.get_sandbox(),
-        limits=limits,
-        signature=incident.signature,
-    )
-    return main.summarize(state)
+    try:
+        with repository_source(main.REPO_ROOT) as source:
+            agent_options = {}
+            if source.path_prefix is not None:
+                agent_options["path_prefix"] = source.path_prefix
+                sandbox = main.get_sandbox_for_repo(source.repo_root)
+            else:
+                sandbox = main.get_sandbox()
+            state = main.run_agent(
+                main.get_llm(),
+                main.get_store(),
+                trace=incident.sample_trace,
+                service_name=incident.service_name,
+                repo_root=source.repo_root,
+                incident_id=incident.id,
+                sandbox=sandbox,
+                limits=limits,
+                signature=incident.signature,
+                **agent_options,
+            )
+        return main.summarize(state)
+    except GitHubSourceError as error:
+        return {
+            "status": "escalated",
+            "reason": str(error),
+            "signature": incident.signature,
+        }
 
 
 def _default_auto_deliverer(summary, incident):
@@ -110,7 +129,10 @@ def _default_auto_deliverer(summary, incident):
         summary,
         incident,
         client,
-        path_prefix=os.getenv("TARGET_REPO_PATH_PREFIX", ""),
+        path_prefix=(
+            "" if uses_github_source()
+            else os.getenv("TARGET_REPO_PATH_PREFIX", "")
+        ),
     )
     return asdict(result)
 
@@ -240,7 +262,7 @@ def _maybe_auto_analyze(
         }:
             reason = result["reason"]
         elif status == "escalated":
-            reason = "Automatic analysis was escalated."
+            reason = result.get("reason") or "Automatic analysis was escalated."
 
         delivery = {}
         deliver_enabled = os.getenv(
