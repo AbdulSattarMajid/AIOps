@@ -11,13 +11,23 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.parse import quote, urlsplit
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+)
 
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_UNPACKED_BYTES = 50 * 1024 * 1024
 MAX_FILES = 5_000
 DOWNLOAD_TIMEOUT_SECONDS = 5
+_ALLOWED_ARCHIVE_HOSTS = {
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+}
 
 
 class GitHubSourceError(RuntimeError):
@@ -42,21 +52,72 @@ def download_repository_zip(
         url,
         headers={
             "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
+            "Authorization": "Bearer " + token,
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
+
+    class _NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, new_url):
+            return None
+
+    def read_archive(response) -> bytes:
+        archive = response.read(MAX_DOWNLOAD_BYTES + 1)
+        if len(archive) > MAX_DOWNLOAD_BYTES:
+            raise GitHubSourceError(
+                "GitHub repository snapshot exceeds the 20 MB download limit."
+            )
+        return archive
+
+    def is_allowed_location(location: str) -> bool:
+        if not location.startswith("https://"):
+            return False
+        try:
+            parsed = urlsplit(location)
+            host = parsed.hostname
+        except ValueError:
+            return False
+        if not host or parsed.username or parsed.password:
+            return False
+        host = host.lower()
+        return host in _ALLOWED_ARCHIVE_HOSTS or host.endswith(
+            ".githubusercontent.com"
+        )
+
+    opener = build_opener(_NoRedirect())
     try:
-        with urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
-            archive = response.read(MAX_DOWNLOAD_BYTES + 1)
+        try:
+            with opener.open(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+                if response.getcode() != 200:
+                    raise GitHubSourceError(
+                        "Could not download the GitHub repository snapshot."
+                    )
+                archive = read_archive(response)
+        except HTTPError as redirect:
+            if redirect.code not in {301, 302, 303, 307, 308}:
+                raise GitHubSourceError(
+                    "Could not download the GitHub repository snapshot."
+                ) from None
+            location = redirect.headers.get("Location", "")
+            if not is_allowed_location(location):
+                raise GitHubSourceError(
+                    "GitHub repository snapshot redirect was not allowed."
+                ) from None
+            redirect_request = Request(location)
+            with opener.open(
+                redirect_request, timeout=DOWNLOAD_TIMEOUT_SECONDS
+            ) as response:
+                if response.getcode() != 200:
+                    raise GitHubSourceError(
+                        "Could not download the GitHub repository snapshot."
+                    )
+                archive = read_archive(response)
+    except GitHubSourceError:
+        raise
     except Exception:  # noqa: BLE001 - prevent transport details leaking credentials
         raise GitHubSourceError(
             "Could not download the GitHub repository snapshot."
         ) from None
-    if len(archive) > MAX_DOWNLOAD_BYTES:
-        raise GitHubSourceError(
-            "GitHub repository snapshot exceeds the 20 MB download limit."
-        )
     return archive
 
 

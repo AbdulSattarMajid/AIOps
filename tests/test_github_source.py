@@ -4,8 +4,10 @@ import logging
 import stat
 import zipfile
 from dataclasses import dataclass
+from email.message import Message
 from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
@@ -149,23 +151,31 @@ def test_download_uses_auth_header_and_short_timeout_without_leaking_token(
     observed = {}
 
     class FakeResponse:
+        status = 200
+
         def __enter__(self):
             return self
 
         def __exit__(self, *_args):
             return None
 
+        def getcode(self):
+            return self.status
+
         def read(self, size):
             observed["read_size"] = size
             return b"fake archive"
 
-    def fake_urlopen(request, timeout):
-        observed["url"] = request.full_url
-        observed["authorization"] = request.get_header("Authorization")
-        observed["timeout"] = timeout
-        return FakeResponse()
+    class FakeOpener:
+        def open(self, request, timeout):
+            observed["url"] = request.full_url
+            observed["authorization"] = request.get_header("Authorization")
+            observed["timeout"] = timeout
+            return FakeResponse()
 
-    monkeypatch.setattr(github_source, "urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        github_source, "build_opener", lambda *_handlers: FakeOpener()
+    )
     with caplog.at_level(logging.ERROR):
         payload = github_source.download_repository_zip(
             "example/shop", TOKEN, "feature/demo"
@@ -178,6 +188,125 @@ def test_download_uses_auth_header_and_short_timeout_without_leaking_token(
     assert observed["timeout"] <= 5
     assert observed["read_size"] == github_source.MAX_DOWNLOAD_BYTES + 1
     assert TOKEN not in caplog.text
+
+
+def _redirect(location: str) -> HTTPError:
+    headers = Message()
+    headers["Location"] = location
+    return HTTPError(
+        "https://api.github.com/archive",
+        302,
+        "Found",
+        headers,
+        None,
+    )
+
+
+class _ArchiveResponse:
+    def __init__(self, payload: bytes = b"archive"):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+    def getcode(self):
+        return 200
+
+    def read(self, size):
+        assert size == github_source.MAX_DOWNLOAD_BYTES + 1
+        return self.payload
+
+
+def test_redirect_download_omits_authorization_on_second_request(monkeypatch):
+    observed = []
+    responses = [
+        _redirect("https://codeload.github.com/example/shop/legacy.zip/main"),
+        _ArchiveResponse(b"redirected archive"),
+    ]
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            observed.append((request, timeout))
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    monkeypatch.setattr(
+        github_source, "build_opener", lambda *_handlers: FakeOpener()
+    )
+    payload = github_source.download_repository_zip("example/shop", TOKEN)
+
+    assert payload == b"redirected archive"
+    assert len(observed) == 2
+    assert observed[0][0].get_header("Authorization") == f"Bearer {TOKEN}"
+    assert observed[1][0].get_header("Authorization") is None
+    assert observed[0][1] == observed[1][1] == github_source.DOWNLOAD_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://github.com/archive.zip",
+        "https://evil.example.com/archive.zip",
+        "https://github.com.evil.example.com/archive.zip",
+    ],
+)
+def test_untrusted_redirect_locations_are_rejected_without_leaking_token(
+    monkeypatch, location
+):
+    class FakeOpener:
+        def open(self, _request, timeout):
+            raise _redirect(location)
+
+    monkeypatch.setattr(
+        github_source, "build_opener", lambda *_handlers: FakeOpener()
+    )
+    with pytest.raises(github_source.GitHubSourceError) as error:
+        github_source.download_repository_zip("example/shop", TOKEN)
+
+    assert "redirect" in str(error.value)
+    assert location not in str(error.value)
+    assert TOKEN not in str(error.value)
+
+
+def test_second_redirect_is_rejected_without_leaking_token(monkeypatch):
+    observed = []
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            observed.append(request)
+            if len(observed) == 1:
+                raise _redirect("https://codeload.github.com/archive.zip")
+            raise _redirect("https://github.com/another-redirect.zip")
+
+    monkeypatch.setattr(
+        github_source, "build_opener", lambda *_handlers: FakeOpener()
+    )
+    with pytest.raises(github_source.GitHubSourceError) as error:
+        github_source.download_repository_zip("example/shop", TOKEN)
+
+    assert len(observed) == 2
+    assert observed[1].get_header("Authorization") is None
+    assert TOKEN not in str(error.value)
+
+
+def test_direct_200_response_is_read_without_redirect(monkeypatch):
+    class FakeOpener:
+        def open(self, _request, timeout):
+            return _ArchiveResponse(b"direct archive")
+
+    monkeypatch.setattr(
+        github_source, "build_opener", lambda *_handlers: FakeOpener()
+    )
+
+    assert (
+        github_source.download_repository_zip("example/shop", TOKEN)
+        == b"direct archive"
+    )
 
 
 def test_github_snapshot_is_removed_when_analysis_body_raises(tmp_path):
