@@ -11,7 +11,9 @@ from aiops.agent.llm import (
     MissingAPIKeyError,
     MissingModelError,
 )
+from aiops.agent.prompts import build_user_prompt
 from aiops.rag.store import RunbookStore
+from aiops.sandbox.runner import SandboxResult
 
 ROOT = "mock_services/sample_app"
 TRACE = """Traceback (most recent call last):
@@ -98,6 +100,80 @@ def test_prompt_contains_code_and_matching_runbook(store):
     assert "def get_user_email" in prompt
     assert "<untrusted_code" in prompt
     assert "Null result from user lookup" in prompt
+
+
+def test_prompt_shows_exact_headers_for_nested_file_path():
+    prompt = build_user_prompt({"rel_path": "demo_shop/payments.py"})
+
+    assert (
+        "Copy these exact file header lines, including every slash:\n"
+        "--- a/demo_shop/payments.py\n"
+        "+++ b/demo_shop/payments.py"
+    ) in prompt
+
+
+def test_nested_path_patch_passes_validation_and_reaches_sandbox(store, tmp_path):
+    repo_root = tmp_path
+    payments = repo_root / "demo_shop" / "payments.py"
+    payments.parent.mkdir()
+    payments.write_text(
+        "def load_payment_config():\n    return None\n",
+        encoding="utf-8",
+    )
+    trace = """Traceback (most recent call last):
+  File "/app/demo_shop/payments.py", line 2, in load_payment_config
+    return None
+RuntimeError: payment setup failed"""
+    diff = """--- a/demo_shop/payments.py
++++ b/demo_shop/payments.py
+@@ -1,2 +1,2 @@
+ def load_payment_config():
+-    return None
++    return "configured"
+"""
+
+    class FakeSandbox:
+        def __init__(self):
+            self.verify_calls = []
+
+        def baseline(self):
+            return SandboxResult(
+                status="failed",
+                exit_code=1,
+                output="",
+                duration_seconds=0.01,
+                tests_passed=0,
+                tests_failed=1,
+                failed_tests=["test_payments.py::test_missing_config"],
+            )
+
+        def verify(self, rel_path, new_source):
+            self.verify_calls.append((rel_path, new_source))
+            return SandboxResult(
+                status="passed",
+                exit_code=0,
+                output="",
+                duration_seconds=0.01,
+                tests_passed=1,
+                tests_failed=0,
+            )
+
+    sandbox = FakeSandbox()
+    llm = FakeLLM({"def load_payment_config": [diff]})
+    result = run_agent(
+        llm,
+        store,
+        trace,
+        "shop-service",
+        str(repo_root),
+        sandbox=sandbox,
+    )
+
+    assert result["status"] == "verified"
+    assert result["attempt"] == 1
+    assert len(sandbox.verify_calls) == 1
+    assert sandbox.verify_calls[0][0] == "demo_shop/payments.py"
+    assert 'return "configured"' in sandbox.verify_calls[0][1]
 
 
 def test_hostile_log_cannot_close_its_untrusted_fence(store):

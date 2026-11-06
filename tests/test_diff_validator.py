@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from aiops.agent.diff_validator import validate_diff
 from aiops.agent.prompts import SYSTEM_PROMPT
 
@@ -91,6 +93,142 @@ def test_context_mismatch_is_rejected():
 
 def test_diff_for_another_file_is_rejected():
     result = validate_diff(GOOD_DIFF, "config.py", SOURCE)
+    assert not result.ok
+    assert "file paths" in result.error
+
+
+def test_dot_b_prefix_is_rejected():
+    source = "def charge():\n    return False\n"
+    diff = (
+        "--- a/demo_shop/payments.py\n"
+        "+++ b.demo_shop/payments.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def charge():\n"
+        "-    return False\n"
+        "+    return True\n"
+    )
+
+    result = validate_diff(diff, "demo_shop/payments.py", source)
+
+    assert not result.ok
+    assert "file paths" in result.error
+
+
+@pytest.mark.parametrize(
+    ("old_header", "new_header"),
+    [
+        ("demo_shop/payments.py", "demo_shop/payments.py"),
+        ("./demo_shop/payments.py", "./demo_shop/payments.py"),
+    ],
+)
+def test_nested_headers_without_a_b_prefix_are_accepted_and_canonical(
+    old_header, new_header
+):
+    source = "def charge():\n    return False\n"
+    diff = (
+        f"--- {old_header}\n"
+        f"+++ {new_header}\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def charge():\n"
+        "-    return False\n"
+        "+    return True\n"
+    )
+
+    result = validate_diff(diff, "demo_shop/payments.py", source)
+
+    assert result.ok
+    assert result.clean_diff.startswith(
+        "--- a/demo_shop/payments.py\n+++ b/demo_shop/payments.py\n"
+    )
+
+
+def test_nested_a_b_headers_are_accepted_and_canonical():
+    source = "def charge():\n    return False\n"
+    diff = (
+        "--- a/demo_shop/payments.py\n"
+        "+++ b/demo_shop/payments.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def charge():\n"
+        "-    return False\n"
+        "+    return True\n"
+    )
+
+    result = validate_diff(diff, "demo_shop/payments.py", source)
+
+    assert result.ok
+    assert result.clean_diff.startswith(
+        "--- a/demo_shop/payments.py\n+++ b/demo_shop/payments.py\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "header_path",
+    ["/demo_shop/payments.py", "C:/demo_shop/payments.py", "../x.py"],
+)
+def test_absolute_and_traversal_header_paths_are_rejected(header_path):
+    source = "def charge():\n    return False\n"
+    diff = (
+        "--- a/demo_shop/payments.py\n"
+        f"+++ {header_path}\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def charge():\n"
+        "-    return False\n"
+        "+    return True\n"
+    )
+
+    result = validate_diff(diff, "demo_shop/payments.py", source)
+
+    assert not result.ok
+    assert "file paths" in result.error
+
+
+def test_two_different_header_paths_are_rejected():
+    source = "def charge():\n    return False\n"
+    diff = (
+        "--- a/demo_shop/payments.py\n"
+        "+++ b/other/file.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def charge():\n"
+        "-    return False\n"
+        "+    return True\n"
+    )
+
+    result = validate_diff(diff, "demo_shop/payments.py", source)
+
+    assert not result.ok
+    assert "file paths" in result.error
+
+
+def test_dot_b_prefix_for_another_file_is_rejected():
+    source = "def charge():\n    return False\n"
+    diff = (
+        "--- a/demo_shop/payments.py\n"
+        "+++ b.other/file.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def charge():\n"
+        "-    return False\n"
+        "+    return True\n"
+    )
+
+    result = validate_diff(diff, "demo_shop/payments.py", source)
+
+    assert not result.ok
+    assert "file paths" in result.error
+
+
+def test_parent_traversal_in_slash_header_is_rejected():
+    source = "def charge():\n    return False\n"
+    diff = (
+        "--- a/demo_shop/payments.py\n"
+        "+++ b/../etc/passwd\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def charge():\n"
+        "-    return False\n"
+        "+    return True\n"
+    )
+
+    result = validate_diff(diff, "demo_shop/payments.py", source)
+
     assert not result.ok
     assert "file paths" in result.error
 
