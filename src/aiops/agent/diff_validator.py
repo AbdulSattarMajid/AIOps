@@ -2,6 +2,7 @@ import ast
 import difflib
 import re
 from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
 from aiops.security.redaction import source_secret_findings
@@ -67,9 +68,24 @@ def _extract_diff_text(reply: str) -> str:
 
 
 def _header_path(line: str, marker: str) -> str:
-    path = line[len(marker):].split("\t", 1)[0].strip()
-    if path.startswith("a/") or path.startswith("b/"):
-        path = path[2:]
+    return line[len(marker):].split("\t", 1)[0].strip()
+
+
+def _normalise_header_path(path: str, rel_path: str) -> Optional[str]:
+    for prefix in ("a/", "b/", "./"):
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+            break
+    if (
+        not path
+        or "\\" in path
+        or PurePosixPath(path).is_absolute()
+        or PureWindowsPath(path).is_absolute()
+        or PureWindowsPath(path).drive
+        or any(part in ("", ".", "..") for part in path.split("/"))
+        or path != rel_path
+    ):
+        return None
     return path
 
 
@@ -287,11 +303,15 @@ def validate_diff(reply: str, rel_path: str, source: str,
         file_diff = files[0]
         if file_diff.old_path == "/dev/null" or file_diff.new_path == "/dev/null":
             raise DiffError("Creating or deleting files is not allowed.")
-        if file_diff.old_path != rel_path or file_diff.new_path != rel_path:
+        old_path = _normalise_header_path(file_diff.old_path, rel_path)
+        new_path = _normalise_header_path(file_diff.new_path, rel_path)
+        if old_path is None or new_path is None or old_path != new_path:
             raise DiffError(
                 f"Diff file paths must both be {rel_path!r}; "
                 f"got {file_diff.old_path!r} and {file_diff.new_path!r}."
             )
+        file_diff.old_path = old_path
+        file_diff.new_path = new_path
         # Reject before applying: a patch that adds a hardcoded secret must
         # never produce a new_source that we then send to the sandbox or repo.
         _check_added_lines_for_secrets(file_diff.hunks)

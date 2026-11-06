@@ -78,13 +78,16 @@ def fence(tag: str, text: str, **attrs: str) -> str:
 
 
 def build_user_prompt(state: Dict) -> str:
+    rel_path = state.get("rel_path", "")
     crash_report = _clean("{}\n{}".format(
         state.get("signature", ""),
         state.get("trace", ""),
     )[:4000])
     parts = [
         "Service: {}".format(state.get("service_name", "")),
-        "File to change: {}".format(state.get("rel_path", "")),
+        "File to change: {}".format(rel_path),
+        "Copy these exact file header lines, including every slash:\n"
+        "--- a/{}\n+++ b/{}".format(rel_path, rel_path),
         "Function: {}".format(state.get("function_name", "")),
         "Crash report:\n{}".format(fence("crash_report", crash_report)),
         "Function source:\n{}".format(
