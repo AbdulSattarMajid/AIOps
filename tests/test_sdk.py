@@ -133,6 +133,38 @@ def test_traceback_rewrites_only_paths_inside_app_root(monkeypatch, tmp_path):
     assert str(Path(__file__).resolve()) in trace
 
 
+def test_path_rewriting_leaves_frozen_and_relative_frames_unchanged(tmp_path):
+    reporter = aiops_sdk._Reporter(
+        api_url="http://127.0.0.1:8000",
+        api_key="test-key",
+        service_name="shop-service",
+        app_root=tmp_path,
+    )
+    trace = (
+        '  File "<frozen os>", line 1, in frozen_func\n'
+        '  File "<string>", line 2, in dynamic_func\n'
+        '  File "relative/module.py", line 3, in relative_func\n'
+    )
+
+    assert reporter._rewrite_app_paths(trace) == trace
+
+
+@pytest.mark.parametrize("api_url", ["", "ftp://example.invalid", "//example.invalid"])
+def test_install_rejects_non_http_urls_without_exposing_api_key(api_url):
+    api_key = "private-test-key"
+
+    with pytest.raises(ValueError) as error:
+        aiops_sdk.install(
+            FastAPI(),
+            api_url=api_url,
+            api_key=api_key,
+            service_name="shop-service",
+        )
+
+    assert "http://" in str(error.value)
+    assert api_key not in str(error.value)
+
+
 def test_sends_schema_payload_to_logs_endpoint_with_api_key(monkeypatch, tmp_path):
     observed: dict[str, object] = {}
     sent = threading.Event()

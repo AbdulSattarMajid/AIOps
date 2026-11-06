@@ -82,9 +82,14 @@ class _Reporter:
 
     def _rewrite_app_paths(self, formatted: str) -> str:
         def rewrite_frame(match: re.Match[str]) -> str:
+            filename = match.group(2)[1:-1]
+            if filename.startswith("<"):
+                return match.group(0)
             try:
-                filename = match.group(2)[1:-1]
-                path = Path(filename).resolve()
+                path = Path(filename)
+                if not path.is_absolute():
+                    return match.group(0)
+                path = path.resolve()
                 relative = path.relative_to(self.app_root)
             except (OSError, ValueError):
                 return match.group(0)
@@ -142,6 +147,8 @@ def install(
     app_root: str | os.PathLike[str] | None = None,
 ) -> None:
     """Install exception reporting middleware on a FastAPI/ASGI application."""
+    if not api_url.startswith(("http://", "https://")):
+        raise ValueError("api_url must start with http:// or https://")
     reporter = _Reporter(
         api_url=api_url,
         api_key=api_key,
