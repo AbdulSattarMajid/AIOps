@@ -24,6 +24,7 @@ from aiops.storage.redis_store import (
     QUEUE_STREAM,
     RedisStore,
     get_redis,
+    save_analysis_detail_safely,
 )
 
 RECLAIM_IDLE_MS = int(os.getenv("STREAM_RECLAIM_IDLE_MS", "60000"))
@@ -108,7 +109,11 @@ def _default_auto_analyzer(incident, limits):
                 signature=incident.signature,
                 **agent_options,
             )
-        return main.summarize(state)
+        summary = main.summarize(state)
+        if state.get("history") or state.get("last_reply"):
+            summary["_analysis_history"] = state.get("history", [])
+            summary["_analysis_last_reply"] = state.get("last_reply", "")
+        return summary
     except GitHubSourceError as error:
         return {
             "status": "escalated",
@@ -249,10 +254,12 @@ def _maybe_auto_analyze(
             result = auto_analyzer(incident, limits)
             status = str(result.get("status", "escalated"))
         except Exception:
-            result = {"status": "escalated"}
+            result = {}
             status = "escalated"
             analysis_failed = True
 
+        analysis_history = result.pop("_analysis_history", None)
+        analysis_last_reply = result.pop("_analysis_last_reply", "")
         reason = ""
         if analysis_failed:
             reason = "Automatic analysis failed; inspect service health."
@@ -286,6 +293,20 @@ def _maybe_auto_analyze(
                 delivery = {}
                 reason = "Automatic PR delivery failed; inspect service health."
 
+        has_summary = "attempts" in result
+        detail_summary = dict(result) if has_summary else None
+        if detail_summary is not None:
+            detail_summary["status"] = status
+            detail_summary["reason"] = reason or detail_summary.get("reason", "")
+        save_analysis_detail_safely(
+            processor.store,
+            incident.id,
+            detail_summary,
+            history=analysis_history,
+            last_reply=analysis_last_reply,
+            status=status,
+            reason=reason,
+        )
         _record_auto_result(processor, incident, status, reason)
         webhook = os.getenv("SLACK_WEBHOOK_URL", "")
         if webhook:

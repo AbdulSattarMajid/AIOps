@@ -18,6 +18,19 @@ from aiops.storage import redis_store
 # Generate a consistent test API key and hash for test sessions
 TEST_API_KEY = "test-aiops-key-" + "valid-for-tests-secret"
 TEST_API_KEY_HASH = hash_api_key(TEST_API_KEY)
+DEVELOPER_SETTINGS_TO_CLEAR = (
+    "SLACK_WEBHOOK_URL",
+    "GITHUB_TOKEN",
+    "GITHUB_REPO",
+    "GITHUB_REF",
+    "GROQ_API_KEY",
+    "AIOPS_AUTO_ANALYZE",
+    "AIOPS_AUTO_DELIVER_PR",
+    "AUTO_DELIVER_PR",
+    "AIOPS_LLM",
+    "AIOPS_CODE_SOURCE",
+    "TARGET_REPO_PATH_PREFIX",
+)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -45,17 +58,7 @@ def reset_rate_limiter_and_auth():
 @pytest.fixture(autouse=True)
 def clear_developer_settings(monkeypatch):
     """Keep developer .env credentials and live integrations out of tests."""
-    for name in (
-        "SLACK_WEBHOOK_URL",
-        "GITHUB_TOKEN",
-        "GITHUB_REPO",
-        "GROQ_API_KEY",
-        "AIOPS_AUTO_ANALYZE",
-        "AIOPS_AUTO_DELIVER_PR",
-        "AUTO_DELIVER_PR",
-        "AIOPS_LLM",
-        "TARGET_REPO_PATH_PREFIX",
-    ):
+    for name in DEVELOPER_SETTINGS_TO_CLEAR:
         monkeypatch.delenv(name, raising=False)
 
 

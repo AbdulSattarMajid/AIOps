@@ -34,6 +34,7 @@ from aiops.storage.redis_store import (
     RedisStoreError,
     enqueue_event,
     queue_stats,
+    save_analysis_detail_safely,
 )
 
 load_dotenv()
@@ -361,6 +362,21 @@ def list_incidents():
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
+@app.get("/api/v1/incidents/{incident_id}/analysis")
+def get_analysis_detail(incident_id: int):
+    try:
+        store = getattr(engine, "store", None)
+        detail = (
+            store.get_analysis_detail(incident_id)
+            if store is not None else None
+        )
+    except RedisStoreError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Analysis detail not found")
+    return detail
+
+
 @app.post("/api/v1/incidents/{incident_id}/analyze")
 def analyze_incident(incident_id: int,
                      slot_info=Depends(acquire_analysis_slot),
@@ -396,12 +412,36 @@ def analyze_incident(incident_id: int,
                 **agent_options,
             )
     except GitHubSourceError as error:
-        return {
+        response = {
             "status": "escalated",
             "reason": str(error),
             "signature": incident.signature,
         }
+        save_analysis_detail_safely(
+            getattr(engine, "store", None),
+            incident.id,
+            None,
+            status=response["status"],
+            reason=response["reason"],
+        )
+        return response
+    except Exception:
+        save_analysis_detail_safely(
+            getattr(engine, "store", None),
+            incident.id,
+            None,
+            status="escalated",
+            reason="Analysis failed before a summary was produced.",
+        )
+        raise
     response = summarize(state)
+    save_analysis_detail_safely(
+        getattr(engine, "store", None),
+        incident.id,
+        response,
+        history=state.get("history", []),
+        last_reply=state.get("last_reply", ""),
+    )
     if deliver_requested:
         incident_data = {
             "id": incident.id,

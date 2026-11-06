@@ -14,6 +14,8 @@ import numpy as np
 import redis
 from redis.exceptions import RedisError, WatchError
 
+from aiops.security.redaction import redact_text
+
 DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_VECTORS_PER_SERVICE = 500
 DEDUP_LOCK_TTL_SECONDS = 10
@@ -47,6 +49,10 @@ class DedupStore(Protocol):
     ) -> None: ...
 
     def get_analysis_result(self, incident_id: int) -> Optional[Dict]: ...
+
+    def record_analysis_detail(self, incident_id: int, detail: Dict) -> None: ...
+
+    def get_analysis_detail(self, incident_id: int) -> Optional[Dict]: ...
 
 
 @lru_cache(maxsize=8)
@@ -99,6 +105,9 @@ class RedisStore:
 
     def _analysis_key(self, incident_id: int) -> str:
         return f"{self.prefix}analysis-result:{incident_id}"
+
+    def _analysis_detail_key(self, incident_id: int) -> str:
+        return f"{self.prefix}analysis-detail:{incident_id}"
 
     def _signature_key(self, signature: str) -> str:
         return f"{self.prefix}signature:{signature}"
@@ -325,6 +334,27 @@ class RedisStore:
                 "Redis storage is unavailable; analysis result cannot be read."
             ) from None
 
+    def record_analysis_detail(self, incident_id: int, detail: Dict) -> None:
+        try:
+            self._client().set(
+                self._analysis_detail_key(incident_id),
+                json.dumps(detail, separators=(",", ":")),
+                ex=DEFAULT_TTL_SECONDS,
+            )
+        except RedisError:
+            raise RedisStoreError(
+                "Redis storage is unavailable; analysis detail was not saved."
+            ) from None
+
+    def get_analysis_detail(self, incident_id: int) -> Optional[Dict]:
+        try:
+            raw = self._client().get(self._analysis_detail_key(incident_id))
+            return json.loads(raw) if raw is not None else None
+        except RedisError:
+            raise RedisStoreError(
+                "Redis storage is unavailable; analysis detail cannot be read."
+            ) from None
+
 
 class InMemoryStore:
     """Process-local test store; production defaults to RedisStore."""
@@ -337,6 +367,7 @@ class InMemoryStore:
         self._next_id = 1
         self._processed: Dict[str, int] = {}
         self._analysis_results: Dict[int, Dict] = {}
+        self._analysis_details: Dict[int, Dict] = {}
         self._lock = threading.RLock()
 
     def process(
@@ -413,6 +444,110 @@ class InMemoryStore:
         with self._lock:
             result = self._analysis_results.get(incident_id)
             return dict(result) if result is not None else None
+
+    def record_analysis_detail(self, incident_id: int, detail: Dict) -> None:
+        with self._lock:
+            self._analysis_details[incident_id] = detail
+
+    def get_analysis_detail(self, incident_id: int) -> Optional[Dict]:
+        with self._lock:
+            detail = self._analysis_details.get(incident_id)
+            return dict(detail) if detail is not None else None
+
+
+def _redact_detail_value(value):
+    if isinstance(value, str):
+        return redact_text(value)[0]
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_detail_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_detail_value(item) for item in value]
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    return redact_text(str(value))[0]
+
+
+def build_analysis_detail(
+    summary: Optional[Dict],
+    *,
+    history=None,
+    last_reply: str = "",
+    status: str = "escalated",
+    reason: str = "",
+) -> Dict:
+    if summary is None:
+        return {
+            "status": _redact_detail_value(status),
+            "reason": _redact_detail_value(reason),
+        }
+
+    history = summary.get("history", []) if history is None else history
+    attempts = summary.get("attempts", 0)
+    rejected_attempts = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        attempt = entry.get("attempt", 0)
+        proposed_diff = entry.get("reply", "")
+        if not proposed_diff and attempt == attempts:
+            proposed_diff = last_reply
+        error_text = _redact_detail_value(str(entry.get("error", "")))
+        proposed_diff = _redact_detail_value(str(proposed_diff))
+        rejected_attempts.append({
+            "attempt": attempt,
+            "stage": _redact_detail_value(str(entry.get("stage", ""))),
+            "error": error_text[:500],
+            "proposed_diff": proposed_diff[:1500],
+        })
+
+    test_evidence = {}
+    for key in (
+        "baseline_tests_passed",
+        "baseline_tests_failed",
+        "baseline_failed_tests",
+        "after_failed_tests",
+        "verification",
+    ):
+        value = summary.get(key)
+        if value not in (None, [], {}):
+            test_evidence[key] = value
+    return _redact_detail_value({
+        "status": summary.get("status", "escalated"),
+        "reason": summary.get("reason", ""),
+        "attempts": attempts,
+        "tokens_used": summary.get("tokens_used", 0),
+        "rejected_attempts": rejected_attempts,
+        "patch": _redact_detail_value(str(summary.get("patch", "")))[:4000],
+        "function": summary.get("function", ""),
+        "file": summary.get("file", ""),
+        "test_evidence": test_evidence,
+    })
+
+
+def save_analysis_detail_safely(
+    store,
+    incident_id: int,
+    summary: Optional[Dict],
+    *,
+    history=None,
+    last_reply: str = "",
+    status: str = "escalated",
+    reason: str = "",
+) -> None:
+    try:
+        detail = build_analysis_detail(
+            summary,
+            history=history,
+            last_reply=last_reply,
+            status=status,
+            reason=reason,
+        )
+        store.record_analysis_detail(incident_id, detail)
+    except Exception:
+        return
 
 
 def _stream_max_len() -> int:

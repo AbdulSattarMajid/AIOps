@@ -11,6 +11,7 @@ from urllib.error import HTTPError
 
 import pytest
 
+from tests.conftest import DEVELOPER_SETTINGS_TO_CLEAR
 from aiops.context import github_source
 from aiops.context.extract import resolve_repo_path
 from aiops.delivery.github_pr import DeliveryResult, _safe_repo_path
@@ -23,6 +24,11 @@ SETTINGS = {
     "GITHUB_TOKEN": TOKEN,
     "GITHUB_REF": "feature/demo",
 }
+
+
+def test_autouse_fixture_clears_github_source_settings():
+    assert "AIOPS_CODE_SOURCE" in DEVELOPER_SETTINGS_TO_CLEAR
+    assert "GITHUB_REF" in DEVELOPER_SETTINGS_TO_CLEAR
 
 
 def _zip_bytes(files: dict[str, bytes] | None = None) -> bytes:
