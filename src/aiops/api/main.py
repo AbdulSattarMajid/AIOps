@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 from aiops.agent.fake_llm import make_demo_llm
 from aiops.agent.graph import run_agent, summarize
 from aiops.agent.llm import GroqLLM, MissingAPIKeyError, MissingModelError
+from aiops.context.github_source import GitHubSourceError, repository_source
 from aiops.dedup.engine import DedupEngine
 from aiops.delivery.github_pr import DeliveryError, PyGithubClient, deliver
 from aiops.delivery.slack import build_slack_text, post_slack
@@ -20,12 +21,13 @@ from aiops.rag.store import RunbookStore
 from aiops.sandbox.app_sandbox import AppSandbox
 from aiops.sandbox.runner import is_docker_available
 from aiops.security.auth import get_configured_hashes, redact_headers, verify_api_key
-from aiops.security.redaction import redact_log_event
 from aiops.security.ratelimit import (
     RateLimiter,
     default_limiter,
     get_rate_limit_config,
 )
+from aiops.security.redaction import redact_log_event
+from aiops.storage import redis_store
 from aiops.storage.redis_store import (
     DEAD_LETTER_STREAM,
     QUEUE_STREAM,
@@ -33,7 +35,6 @@ from aiops.storage.redis_store import (
     enqueue_event,
     queue_stats,
 )
-from aiops.storage import redis_store
 
 load_dotenv()
 
@@ -233,8 +234,12 @@ def get_llm():
 
 
 def get_sandbox():
+    return get_sandbox_for_repo(REPO_ROOT)
+
+
+def get_sandbox_for_repo(repo_root):
     if os.getenv("AIOPS_SANDBOX", "on") != "off" and is_docker_available():
-        return AppSandbox(REPO_ROOT)
+        return AppSandbox(repo_root)
     return None
 
 
@@ -371,17 +376,31 @@ def analyze_incident(incident_id: int,
         raise HTTPException(status_code=503, detail=str(error)) from error
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
-    state = run_agent(
-        llm,
-        store,
-        trace=incident.sample_trace,
-        service_name=incident.service_name,
-        repo_root=REPO_ROOT,
-        incident_id=incident.id,
-        sandbox=sandbox,
-        limits=limits,
-        signature=incident.signature,
-    )
+    try:
+        with repository_source(REPO_ROOT) as source:
+            agent_options = {}
+            analysis_sandbox = sandbox
+            if source.path_prefix is not None:
+                agent_options["path_prefix"] = source.path_prefix
+                analysis_sandbox = get_sandbox_for_repo(source.repo_root)
+            state = run_agent(
+                llm,
+                store,
+                trace=incident.sample_trace,
+                service_name=incident.service_name,
+                repo_root=source.repo_root,
+                incident_id=incident.id,
+                sandbox=analysis_sandbox,
+                limits=limits,
+                signature=incident.signature,
+                **agent_options,
+            )
+    except GitHubSourceError as error:
+        return {
+            "status": "escalated",
+            "reason": str(error),
+            "signature": incident.signature,
+        }
     response = summarize(state)
     if deliver_requested:
         incident_data = {
@@ -400,7 +419,10 @@ def analyze_incident(incident_id: int,
             response,
             incident_data,
             github,
-            path_prefix=os.getenv("TARGET_REPO_PATH_PREFIX", ""),
+            path_prefix=(
+                "" if source.path_prefix is not None
+                else os.getenv("TARGET_REPO_PATH_PREFIX", "")
+            ),
             slack=slack_callback,
         )
         response["delivery"] = asdict(delivery)
