@@ -43,11 +43,27 @@ def reset_rate_limiter_and_auth():
 
 
 @pytest.fixture(autouse=True)
-def reset_redis(monkeypatch):
+def clear_developer_settings(monkeypatch):
+    """Keep developer .env credentials and live integrations out of tests."""
+    for name in (
+        "SLACK_WEBHOOK_URL",
+        "GITHUB_TOKEN",
+        "GITHUB_REPO",
+        "GROQ_API_KEY",
+        "AIOPS_AUTO_ANALYZE",
+        "AIOPS_AUTO_DELIVER_PR",
+        "AUTO_DELIVER_PR",
+        "AIOPS_LLM",
+        "TARGET_REPO_PATH_PREFIX",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def reset_redis(monkeypatch, clear_developer_settings):
     client = fakeredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(redis_store, "get_redis", lambda: client)
     monkeypatch.setenv("AIOPS_INGEST_MODE", "inline")
-    monkeypatch.setenv("AIOPS_AUTO_ANALYZE", "off")
     yield
     client.flushdb()
 
