@@ -52,6 +52,16 @@ def test_parse_pytest_summary_counts_passed_and_failed():
     assert parse_pytest_summary("some non-summary output") == (None, None)
 
 
+def test_parse_pytest_summary_order_and_extra_categories():
+    assert parse_pytest_summary("1 failed, 43 passed, 6 warnings in 15.82s") == (43, 1)
+    assert parse_pytest_summary("44 passed in 3.2s") == (44, 0)
+    assert parse_pytest_summary("2 failed, 5 passed, 1 skipped, 3 warnings in 1.0s") == (5, 2)
+    assert parse_pytest_summary("1 error in 0.5s") == (0, 0)
+    assert parse_pytest_summary("3 passed, 1 xfailed in 2s") == (3, 0)
+    assert parse_pytest_summary("no tests ran in 0.01s") == (0, 0)
+    assert parse_pytest_summary("=== 1 failed, 43 passed, 6 warnings in 15.82s ===") == (43, 1)
+
+
 def test_parse_failed_tests_extracts_node_ids_without_messages():
     output = (
         "FAILED test_users.py::test_missing_user - AssertionError: expected error\n"

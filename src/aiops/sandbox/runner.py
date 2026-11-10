@@ -12,13 +12,16 @@ from docker.errors import DockerException, ImageNotFound
 _DEFAULT_COMMAND = [
     "python", "-m", "pytest", "-q", "-p", "no:cacheprovider"
 ]
-_SUMMARY_LINE = re.compile(
-    r"(?:\d+\s+(?:passed|failed|error|errors|skipped|xfailed|xpassed)"
-    r"(?:,\s*\d+\s+(?:passed|failed|error|errors|skipped|xfailed|xpassed))*"
-    r"|no tests ran)\s+in\s+[\d.]+s"
+_SUMMARY_KEYWORD = (
+    r"(?:\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|warnings?|deselected|rerun)"
+    r"|no tests ran)"
 )
-_PASSED = re.compile(r"(\d+)\s+passed")
-_FAILED = re.compile(r"(\d+)\s+failed")
+_SUMMARY_LINE = re.compile(
+    rf"{_SUMMARY_KEYWORD}(?:,\s*{_SUMMARY_KEYWORD})*\s+in\s+[\d.]+s",
+    re.IGNORECASE,
+)
+_PASSED = re.compile(r"\b(\d+)\s+passed\b", re.IGNORECASE)
+_FAILED = re.compile(r"\b(\d+)\s+failed\b", re.IGNORECASE)
 _FAILED_TEST = re.compile(r"^(?:FAILED|ERROR) (\S+)")
 
 
