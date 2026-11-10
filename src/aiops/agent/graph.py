@@ -195,14 +195,19 @@ def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
                     limits.release_slot("sandboxes", slot)
                 except LimitStoreError:
                     pass
-        if baseline.status in ("error", "timeout"):
+        if baseline.status in ("error", "timeout", "dependencies_unavailable"):
             message = baseline.message or (
                 "Baseline sandbox tests " + baseline.status + "."
+            )
+            v_status = (
+                "dependencies_unavailable"
+                if baseline.status == "dependencies_unavailable"
+                else "unavailable"
             )
             return {
                 "baseline_result": baseline,
                 "verification": Verification(
-                    "unavailable", message=message
+                    v_status, message=message
                 ),
                 "sandbox_ok": False,
             }
@@ -375,7 +380,7 @@ def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
                 "verification": verification,
                 "reason": verification.message,
             }
-        if verification.status == "unavailable":
+        if verification.status in ("unavailable", "dependencies_unavailable"):
             return {
                 "status": "patch_ready",
                 "verification": verification,

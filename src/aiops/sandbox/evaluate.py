@@ -37,6 +37,12 @@ def evaluate_verification(baseline: SandboxResult, after: SandboxResult,
         "fixed": fixed,
         "after_failed_tests": sorted(after_failures),
     }
+    if after.status == "dependencies_unavailable":
+        return Verification(
+            "dependencies_unavailable",
+            message=after.message or "Sandbox dependencies unavailable.",
+            **common,
+        )
     if after.status == "error":
         return Verification(
             "unavailable", message=after.message or "The sandbox could not run tests.",
