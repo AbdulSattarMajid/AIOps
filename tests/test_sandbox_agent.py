@@ -112,6 +112,130 @@ def test_evaluate_no_target_failure_reports_no_regressions():
     )
 
 
+def test_evaluate_matches_failure_from_different_test_file():
+    test = "tests/test_crud_api.py::test_create_user"
+    verification = evaluate_verification(
+        result(
+            "failed",
+            [test],
+            output=(
+                f"FAILED {test} - AttributeError: 'NoneType' object has no "
+                "attribute 'email'\n"
+            ),
+        ),
+        result("passed"),
+        "user",
+        "AttributeError",
+        "'NoneType' object has no attribute 'email'",
+    )
+    assert verification.status == "fix_confirmed"
+    assert verification.related_tests == [test]
+    assert verification.related_test_reasons == {
+        test: "same error class and message"
+    }
+    assert test in verification.message
+    assert "same error class and message" in verification.message
+
+
+def test_evaluate_normalises_uuid_hex_and_numbers_in_messages():
+    test = "tests/test_crud_api.py::test_create_user"
+    verification = evaluate_verification(
+        result(
+            "failed",
+            [test],
+            output=(
+                f"FAILED {test} - RuntimeError: request "
+                "550e8400-e29b-41d4-a716-446655440000 failed at "
+                "0xDEADBEEF after 123\n"
+            ),
+        ),
+        result("passed"),
+        "user",
+        "RuntimeError",
+        "REQUEST 123e4567-e89b-12d3-a456-426614174000 FAILED AT "
+        "0xFEEDC0DE AFTER 456",
+    )
+    assert verification.status == "fix_confirmed"
+    assert verification.related_test_reasons == {
+        test: "same error class and message"
+    }
+
+
+def test_evaluate_different_error_class_does_not_match():
+    test = "tests/test_crud_api.py::test_create_user"
+    verification = evaluate_verification(
+        result(
+            "failed",
+            [test],
+            output=f"FAILED {test} - ValueError: user lookup failed\n",
+        ),
+        result("passed"),
+        "user",
+        "LookupError",
+        "user lookup failed",
+    )
+    assert verification.status == "no_regressions"
+    assert verification.related_tests == []
+
+
+def test_evaluate_unrelated_fixed_test_does_not_confirm():
+    test = "tests/test_crud_api.py::test_create_user"
+    verification = evaluate_verification(
+        result(
+            "failed",
+            [test],
+            output=f"FAILED {test} - ValueError: unrelated failure\n",
+        ),
+        result("passed"),
+        "user",
+        "LookupError",
+        "different incident",
+    )
+    assert verification.status == "no_regressions"
+
+
+def test_evaluate_file_name_match_still_confirms():
+    test = "tests/test_user.py::test_create_user"
+    verification = evaluate_verification(
+        result("failed", [test]),
+        result("passed"),
+        "user",
+    )
+    assert verification.status == "fix_confirmed"
+    assert verification.related_test_reasons == {test: "file name"}
+
+
+def test_evaluate_new_failure_blocks_related_test_confirmation():
+    related = "tests/test_crud_api.py::test_create_user"
+    new_failure = "tests/test_other.py::test_other"
+    verification = evaluate_verification(
+        result(
+            "failed",
+            [related],
+            output=f"FAILED {related} - RuntimeError: user lookup failed\n",
+        ),
+        result("failed", [new_failure]),
+        "user",
+        "RuntimeError",
+        "user lookup failed",
+    )
+    assert verification.status == "failed"
+    assert verification.newly_failing == [new_failure]
+
+
+def test_evaluate_missing_failure_summary_does_not_match_incident():
+    test = "tests/test_crud_api.py::test_create_user"
+    verification = evaluate_verification(
+        result("failed", [test], output=""),
+        result("passed"),
+        "user",
+        "RuntimeError",
+        "user lookup failed",
+    )
+    assert verification.status == "no_regressions"
+    assert verification.related_tests == []
+
+
 class FakeSandbox:
     def __init__(self, baseline_result, after_results):
         self.baseline_result = baseline_result
@@ -153,6 +277,27 @@ def test_graph_verified_path_and_summary():
     assert summary["after_failed_tests"] == []
     assert sandbox.baseline_calls == 1
     assert len(sandbox.verify_calls) == 1
+
+
+def test_graph_confirms_failure_with_matching_traceback_error():
+    test = "tests/test_crud_api.py::test_get_user"
+    sandbox = FakeSandbox(
+        result(
+            "failed",
+            [test],
+            output=(
+                f"FAILED {test} - AttributeError: 'NoneType' object has "
+                "no attribute 'email'\n"
+            ),
+        ),
+        [result("passed")],
+    )
+    llm = FakeLLM({"def get_user_email": [GOOD_USERS_DIFF]})
+    state = run_user_agent(llm, sandbox)
+    assert state["verification"].status == "fix_confirmed"
+    assert state["verification"].related_test_reasons == {
+        test: "same error class and message"
+    }
 
 
 def test_graph_retries_test_failure_and_prompt_includes_output():
