@@ -5,13 +5,14 @@ import os
 import re
 import stat
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import (
     HTTPRedirectHandler,
@@ -23,6 +24,12 @@ MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_UNPACKED_BYTES = 50 * 1024 * 1024
 MAX_FILES = 5_000
 DOWNLOAD_TIMEOUT_SECONDS = 5
+# GitHub's download host sometimes stalls on connect (about half of attempts on
+# some networks) while a healthy attempt takes under a second. A short timeout
+# with a few quick retries is far better than one long wait.
+DOWNLOAD_ATTEMPTS = 5
+RETRY_DELAY_SECONDS = 0.5
+_TRANSIENT_HTTP_CODES = {408, 429, 500, 502, 503, 504}
 _ALLOWED_ARCHIVE_HOSTS = {
     "github.com",
     "api.github.com",
@@ -34,16 +41,41 @@ class GitHubSourceError(RuntimeError):
     """A safe, user-presentable repository snapshot failure."""
 
 
+class _TransientDownloadError(GitHubSourceError):
+    """A temporary download failure that is worth retrying."""
+
+
+def _http_failure(code: int) -> GitHubSourceError:
+    message = f"GitHub returned HTTP {code} while downloading the repository snapshot."
+    if code in _TRANSIENT_HTTP_CODES:
+        return _TransientDownloadError(message)
+    if code in {401, 403, 404}:
+        message += " Check GITHUB_REPO and that the token can read the repository."
+    return GitHubSourceError(message)
+
+
+def _classify_download_error(error: Exception) -> GitHubSourceError:
+    """Turn a transport error into a safe, specific reason (never the raw text)."""
+    if isinstance(error, HTTPError):
+        return _http_failure(error.code)
+    reason = error.reason if isinstance(error, URLError) else error
+    if isinstance(reason, TimeoutError):
+        return _TransientDownloadError("GitHub download timed out.")
+    if isinstance(error, (URLError, OSError)):
+        return _TransientDownloadError(
+            f"Could not reach GitHub ({type(reason).__name__})."
+        )
+    return GitHubSourceError("Could not download the GitHub repository snapshot.")
+
+
 @dataclass(frozen=True)
 class RepositorySource:
     repo_root: str
     path_prefix: str | None = None
 
 
-def download_repository_zip(
-    repository: str, token: str, ref: str | None = None
-) -> bytes:
-    """Download a repository archive without including credentials in errors."""
+def _download_once(repository: str, token: str, ref: str | None = None) -> bytes:
+    """One download attempt, without including credentials in errors."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise GitHubSourceError("GITHUB_REPO must be an owner/name repository.")
     suffix = f"/{quote(ref, safe='')}" if ref else ""
@@ -95,9 +127,7 @@ def download_repository_zip(
                 archive = read_archive(response)
         except HTTPError as redirect:
             if redirect.code not in {301, 302, 303, 307, 308}:
-                raise GitHubSourceError(
-                    "Could not download the GitHub repository snapshot."
-                ) from None
+                raise _http_failure(redirect.code) from None
             location = redirect.headers.get("Location", "")
             if not is_allowed_location(location):
                 raise GitHubSourceError(
@@ -114,11 +144,30 @@ def download_repository_zip(
                 archive = read_archive(response)
     except GitHubSourceError:
         raise
-    except Exception:  # noqa: BLE001 - prevent transport details leaking credentials
-        raise GitHubSourceError(
-            "Could not download the GitHub repository snapshot."
-        ) from None
+    except Exception as error:  # noqa: BLE001 - never leak transport details
+        raise _classify_download_error(error) from None
     return archive
+
+
+def download_repository_zip(
+    repository: str,
+    token: str,
+    ref: str | None = None,
+    *,
+    attempts: int = DOWNLOAD_ATTEMPTS,
+    sleep=time.sleep,
+) -> bytes:
+    """Download a repository archive, retrying only temporary failures."""
+    last_failure: GitHubSourceError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _download_once(repository, token, ref)
+        except _TransientDownloadError as failure:
+            last_failure = failure
+            if attempt < attempts:
+                sleep(RETRY_DELAY_SECONDS)
+    reason = str(last_failure).rstrip(".")
+    raise GitHubSourceError(f"{reason} - gave up after {attempts} attempts.") from None
 
 
 def _validated_members(

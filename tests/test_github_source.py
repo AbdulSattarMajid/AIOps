@@ -315,6 +315,150 @@ def test_direct_200_response_is_read_without_redirect(monkeypatch):
     )
 
 
+def _scripted_opener(monkeypatch, script):
+    """Each open() call takes the next scripted result (an Exception is raised)."""
+    calls = []
+
+    class FakeOpener:
+        def open(self, request, timeout):
+            calls.append(request)
+            result = script.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    monkeypatch.setattr(
+        github_source, "build_opener", lambda *_handlers: FakeOpener()
+    )
+    return calls
+
+
+_CODELOAD = "https://codeload.github.com/example/shop/legacy.zip/main"
+
+
+def test_download_retries_a_stalled_second_hop_and_then_succeeds(monkeypatch):
+    from urllib.error import URLError
+
+    calls = _scripted_opener(
+        monkeypatch,
+        [
+            _redirect(_CODELOAD),
+            URLError(TimeoutError("timed out")),
+            _redirect(_CODELOAD),
+            URLError(TimeoutError("timed out")),
+            _redirect(_CODELOAD),
+            _ArchiveResponse(b"third time lucky"),
+        ],
+    )
+    sleeps = []
+    payload = github_source.download_repository_zip(
+        "example/shop", TOKEN, sleep=sleeps.append
+    )
+
+    assert payload == b"third time lucky"
+    assert len(calls) == 6
+    assert len(sleeps) == 2
+    # the download host never receives the token, on any attempt
+    assert [c.get_header("Authorization") for c in calls[1::2]] == [None] * 3
+
+
+def test_download_retries_when_the_first_hop_times_out(monkeypatch):
+    from urllib.error import URLError
+
+    _scripted_opener(
+        monkeypatch,
+        [URLError(TimeoutError("timed out")), _ArchiveResponse(b"ok")],
+    )
+    assert (
+        github_source.download_repository_zip(
+            "example/shop", TOKEN, sleep=lambda _s: None
+        )
+        == b"ok"
+    )
+
+
+def test_download_gives_up_with_a_specific_reason(monkeypatch):
+    from urllib.error import URLError
+
+    calls = _scripted_opener(
+        monkeypatch, [URLError(TimeoutError("timed out"))] * 5
+    )
+    sleeps = []
+    with pytest.raises(github_source.GitHubSourceError) as error:
+        github_source.download_repository_zip(
+            "example/shop", TOKEN, sleep=sleeps.append
+        )
+
+    message = str(error.value)
+    assert "timed out" in message
+    assert "gave up after 5 attempts" in message
+    assert TOKEN not in message
+    assert len(calls) == 5
+    assert len(sleeps) == 4
+
+
+def test_http_404_is_not_retried_and_names_the_status(monkeypatch):
+    calls = _scripted_opener(
+        monkeypatch,
+        [HTTPError("https://api.github.com/x", 404, "Not Found", Message(), None)],
+    )
+    with pytest.raises(github_source.GitHubSourceError) as error:
+        github_source.download_repository_zip(
+            "example/shop", TOKEN, sleep=lambda _s: pytest.fail("must not retry")
+        )
+
+    assert len(calls) == 1
+    assert "HTTP 404" in str(error.value)
+    assert "GITHUB_REPO" in str(error.value)
+    assert TOKEN not in str(error.value)
+
+
+def test_http_503_from_the_download_host_is_retried(monkeypatch):
+    _scripted_opener(
+        monkeypatch,
+        [
+            _redirect(_CODELOAD),
+            HTTPError(_CODELOAD, 503, "Unavailable", Message(), None),
+            _redirect(_CODELOAD),
+            _ArchiveResponse(b"recovered"),
+        ],
+    )
+    assert (
+        github_source.download_repository_zip(
+            "example/shop", TOKEN, sleep=lambda _s: None
+        )
+        == b"recovered"
+    )
+
+
+def test_connection_failure_names_the_error_type_only(monkeypatch):
+    import socket
+    from urllib.error import URLError
+
+    _scripted_opener(
+        monkeypatch,
+        [URLError(socket.gaierror(f"cannot resolve host with {TOKEN}"))] * 5,
+    )
+    with pytest.raises(github_source.GitHubSourceError) as error:
+        github_source.download_repository_zip(
+            "example/shop", TOKEN, sleep=lambda _s: None
+        )
+
+    assert "gaierror" in str(error.value)
+    assert TOKEN not in str(error.value)
+
+
+def test_rejected_redirect_is_not_retried(monkeypatch):
+    calls = _scripted_opener(
+        monkeypatch, [_redirect("https://evil.example.com/archive.zip")]
+    )
+    with pytest.raises(github_source.GitHubSourceError):
+        github_source.download_repository_zip(
+            "example/shop", TOKEN, sleep=lambda _s: pytest.fail("must not retry")
+        )
+    assert len(calls) == 1
+
+
 def test_github_snapshot_is_removed_when_analysis_body_raises(tmp_path):
     archive = _zip_bytes({"app.py": b"pass\n"})
     with (
