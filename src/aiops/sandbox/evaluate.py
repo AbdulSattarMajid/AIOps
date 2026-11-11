@@ -16,6 +16,8 @@ _HEX = re.compile(r"(?<![a-z0-9])(?:0x)?[0-9a-f]{8,}(?![a-z0-9])")
 _DIGITS = re.compile(r"\d+")
 _QUOTES = re.compile(r"""['"`]""")
 _WHITESPACE = re.compile(r"\s+")
+_TRUNCATION_MARKERS = ("...", "\u2026")
+_MIN_TRUNCATED_PREFIX = 5
 
 
 @dataclass
@@ -67,6 +69,25 @@ def _messages_match(first: str, second: str) -> bool:
     )
 
 
+def _summary_matches_incident(summary_message: str, incident_message: str) -> bool:
+    """Compare a pytest summary message with the incident's error message.
+
+    pytest may cut a long summary line and end it with "...". Such a message
+    is compared by prefix (the incident message must start the same way), and
+    only when enough text is left to mean something.
+    """
+    stripped = summary_message.strip()
+    for marker in _TRUNCATION_MARKERS:
+        if stripped.endswith(marker):
+            prefix = stripped[: -len(marker)].rstrip()
+            if len(prefix) < _MIN_TRUNCATED_PREFIX:
+                return False
+            return _normalise_message(incident_message).startswith(
+                _normalise_message(prefix)
+            )
+    return _messages_match(stripped, incident_message)
+
+
 def evaluate_verification(baseline: SandboxResult, after: SandboxResult,
                           module_stem: str, incident_error_class: str = "",
                           incident_error_message: str = "") -> Verification:
@@ -87,7 +108,7 @@ def evaluate_verification(baseline: SandboxResult, after: SandboxResult,
             and failure_detail[0] == incident_error_class
             and incident_error_message
             and failure_detail[1]
-            and _messages_match(failure_detail[1], incident_error_message)
+            and _summary_matches_incident(failure_detail[1], incident_error_message)
         ):
             related_reasons[test] = "same error class and message"
     related_tests = sorted(related_reasons)

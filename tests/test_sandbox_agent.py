@@ -236,6 +236,143 @@ def test_evaluate_missing_failure_summary_does_not_match_incident():
     assert verification.related_tests == []
 
 
+def test_evaluate_real_data_truncated_summary_confirms_with_long_trace():
+    """Real run: pytest cut the summary line to 80 columns ("'Non...")."""
+    incident_trace = (
+        "Traceback (most recent call last):\n"
+        '  File "/app/app/user.py", line 53, in get_user\n'
+        '  detail=f"No User with this id: `{db_user.id}` found",\n'
+        "                                     ^^^^^^^^^^\n"
+        "AttributeError: 'NoneType' object has no attribute 'id'\n"
+    )
+    from aiops.context.stacktrace import parse_python_traceback
+
+    parsed = parse_python_traceback(incident_trace)
+    tests = [
+        "tests/test_crud_api.py::test_get_user_not_found",
+        "tests/test_crud_api.py::test_create_delete_user",
+    ]
+    output = "".join(
+        f"FAILED {test} - AttributeError: 'Non...\n" for test in tests
+    )
+    verification = evaluate_verification(
+        result("failed", tests, output=output),
+        result("passed"),
+        "user",
+        parsed.exception_type or "",
+        parsed.message,
+    )
+    # "'Non" is only 4 characters: too little evidence, so no confirmation.
+    assert verification.status == "no_regressions"
+
+    output = "".join(
+        f"FAILED {test} - AttributeError: 'NoneType' object has...\n"
+        for test in tests
+    )
+    verification = evaluate_verification(
+        result("failed", tests, output=output),
+        result("passed"),
+        "user",
+        parsed.exception_type or "",
+        parsed.message,
+    )
+    assert verification.status == "fix_confirmed"
+    assert sorted(verification.related_tests) == sorted(tests)
+
+
+def test_evaluate_full_untruncated_real_case_confirms():
+    test = "tests/test_crud_api.py::test_get_user_not_found"
+    verification = evaluate_verification(
+        result(
+            "failed",
+            [test],
+            output=(
+                f"FAILED {test} - AttributeError: "
+                "'NoneType' object has no attribute 'id'\n"
+            ),
+        ),
+        result("passed"),
+        "user",
+        "AttributeError",
+        "'NoneType' object has no attribute 'id'",
+    )
+    assert verification.status == "fix_confirmed"
+
+
+def test_evaluate_truncated_but_different_text_does_not_match():
+    test = "tests/test_crud_api.py::test_get_user_not_found"
+    verification = evaluate_verification(
+        result(
+            "failed",
+            [test],
+            output=f"FAILED {test} - AttributeError: 'str' object has no...\n",
+        ),
+        result("passed"),
+        "user",
+        "AttributeError",
+        "'NoneType' object has no attribute 'id'",
+    )
+    assert verification.status == "no_regressions"
+    assert verification.related_tests == []
+
+
+def test_evaluate_truncated_with_different_class_does_not_match():
+    test = "tests/test_crud_api.py::test_get_user_not_found"
+    verification = evaluate_verification(
+        result(
+            "failed",
+            [test],
+            output=f"FAILED {test} - KeyError: 'NoneType' object has...\n",
+        ),
+        result("passed"),
+        "user",
+        "AttributeError",
+        "'NoneType' object has no attribute 'id'",
+    )
+    assert verification.status == "no_regressions"
+
+
+def test_evaluate_unicode_ellipsis_prefix_matches():
+    test = "tests/test_crud_api.py::test_get_user_not_found"
+    verification = evaluate_verification(
+        result(
+            "failed",
+            [test],
+            output=f"FAILED {test} - AttributeError: 'NoneType' object\u2026\n",
+        ),
+        result("passed"),
+        "user",
+        "AttributeError",
+        "'NoneType' object has no attribute 'id'",
+    )
+    assert verification.status == "fix_confirmed"
+
+
+def test_sandbox_exec_uses_wide_terminal_columns():
+    from unittest.mock import MagicMock, patch
+
+    from aiops.sandbox.runner import run_tests_in_sandbox
+
+    client = MagicMock()
+    container = MagicMock()
+    client.containers.create.return_value = container
+    api = container.client.api
+    api.exec_create.return_value = {"Id": "exec_1"}
+    api.exec_start.return_value = [(b"1 passed in 0.1s", None)]
+    api.exec_inspect.return_value = {"ExitCode": 0}
+    container.attrs = {"State": {"ExitCode": 0, "OOMKilled": False}}
+    with patch("aiops.sandbox.runner._stage_archive"):
+        run_tests_in_sandbox(
+            {"test_a.py": "def test_a():\n    pass\n"}, client=client
+        )
+    kwargs = api.exec_create.call_args.kwargs
+    assert "COLUMNS=300" in kwargs["environment"]
+    create_kwargs = client.containers.create.call_args.kwargs
+    assert create_kwargs["network_mode"] == "none"
+    assert create_kwargs["read_only"] is True
+    assert create_kwargs["user"] == "1000:1000"
+
+
 class FakeSandbox:
     def __init__(self, baseline_result, after_results):
         self.baseline_result = baseline_result

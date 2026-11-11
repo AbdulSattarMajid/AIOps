@@ -12,6 +12,10 @@ from docker.errors import DockerException, ImageNotFound
 _DEFAULT_COMMAND = [
     "python", "-m", "pytest", "-q", "-rf", "-p", "no:cacheprovider"
 ]
+# pytest cuts its "FAILED ... - message" summary lines to the terminal width,
+# and the sandbox has no terminal (80 columns). A wide COLUMNS keeps the
+# error message whole so it can be compared with the incident's error.
+_EXEC_ENVIRONMENT = ["COLUMNS=300"]
 _SUMMARY_KEYWORD = (
     r"(?:\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|warnings?|deselected|rerun)"
     r"|no tests ran)"
@@ -231,6 +235,7 @@ def run_tests_in_sandbox(
                     stderr=True,
                     user="1000:1000",
                     workdir="/work",
+                    environment=_EXEC_ENVIRONMENT,
                 )
                 captured_output = bytearray()
                 for stdout, stderr in api.exec_start(
