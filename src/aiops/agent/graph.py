@@ -363,10 +363,13 @@ def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
                     limits.release_slot("sandboxes", slot)
                 except LimitStoreError:
                     pass
+        incident_error = parse_python_traceback(state.get("trace", ""))
         verification = evaluate_verification(
             state["baseline_result"],
             after,
             Path(state.get("rel_path", "")).stem,
+            incident_error_class=incident_error.exception_type or "",
+            incident_error_message=incident_error.message,
         )
         if verification.status == "fix_confirmed":
             return {

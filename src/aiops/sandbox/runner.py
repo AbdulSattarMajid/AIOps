@@ -10,7 +10,7 @@ import docker
 from docker.errors import DockerException, ImageNotFound
 
 _DEFAULT_COMMAND = [
-    "python", "-m", "pytest", "-q", "-p", "no:cacheprovider"
+    "python", "-m", "pytest", "-q", "-rf", "-p", "no:cacheprovider"
 ]
 _SUMMARY_KEYWORD = (
     r"(?:\d+\s+(?:passed|failed|errors?|skipped|xfailed|xpassed|warnings?|deselected|rerun)"
