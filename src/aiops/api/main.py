@@ -409,6 +409,7 @@ def analyze_incident(incident_id: int,
                 sandbox=analysis_sandbox,
                 limits=limits,
                 signature=incident.signature,
+                classify=os.getenv("AIOPS_CLASSIFIER", "off").lower() == "on",
                 **agent_options,
             )
     except GitHubSourceError as error:
