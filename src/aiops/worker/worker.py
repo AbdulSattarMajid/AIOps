@@ -122,13 +122,31 @@ def _default_auto_analyzer(incident, limits):
         }
 
 
+def _single_line_reason(text, limit=300):
+    return " ".join(str(text).split())[:limit]
+
+
+def _delivery_refused_reason(delivery):
+    """Keep the real reason a delivery was refused, redacted and one line."""
+    from aiops.security.redaction import redact_text
+
+    raw = str((delivery or {}).get("message") or "")
+    message = _single_line_reason(redact_text(raw)[0])
+    if not message:
+        return "Automatic PR delivery was refused."
+    return f"Automatic PR delivery was refused: {message}"
+
+
 def _default_auto_deliverer(summary, incident):
     from aiops.delivery.github_pr import PyGithubClient, deliver
 
     token = os.getenv("GITHUB_TOKEN", "")
     repository = os.getenv("GITHUB_REPO", "")
     if not token or not repository:
-        return {"status": "refused", "url": None}
+        return {
+            "status": "refused", "url": None,
+            "message": "GITHUB_TOKEN or GITHUB_REPO is not set.",
+        }
     client = PyGithubClient(token, repository)
     result = deliver(
         summary,
@@ -288,7 +306,7 @@ def _maybe_auto_analyze(
                     result, incident_data
                 )
                 if delivery.get("status") not in {"opened", "already_open"}:
-                    reason = "Automatic PR delivery was refused."
+                    reason = _delivery_refused_reason(delivery)
             except Exception:
                 delivery = {}
                 reason = "Automatic PR delivery failed; inspect service health."

@@ -333,3 +333,63 @@ def test_delivery_or_slack_error_does_not_stop_worker(
         assert github.created_prs == []
     else:
         assert result["reason"] == "Slack notification failed; inspect service health."
+
+
+def _stored_result_after_delivery(monkeypatch, delivery_result):
+    monkeypatch.setenv("AIOPS_AUTO_ANALYZE", "on")
+    monkeypatch.setenv("AIOPS_AUTO_DELIVER_PR", "on")
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "")
+    client = _client_with_events()
+    engine = _engine(client)
+    _llm, analyze = _real_fake_analysis(monkeypatch, [GOOD_DIFF])
+
+    assert drain_once(
+        client, 1, engine=engine, auto_analyzer=analyze,
+        auto_deliverer=lambda *_: delivery_result, block_ms=0,
+    ) == 1
+    incident = next(iter(engine.incidents.values()))
+    return (
+        engine.store.get_analysis_result(incident.id),
+        engine.store.get_analysis_detail(incident.id),
+    )
+
+
+def test_refused_delivery_keeps_the_real_reason(monkeypatch):
+    message = (
+        "GitHub delivery failed: GitHub request failed: "
+        "Resource not accessible (HTTP 403) creating the branch"
+    )
+    result, detail = _stored_result_after_delivery(
+        monkeypatch, {"status": "refused", "url": None, "message": message}
+    )
+
+    expected = f"Automatic PR delivery was refused: {message}"
+    assert result["reason"] == expected
+    assert detail["reason"] == expected
+
+
+def test_refused_delivery_without_a_message_keeps_the_generic_reason(
+    monkeypatch,
+):
+    result, _detail = _stored_result_after_delivery(
+        monkeypatch, {"status": "refused", "url": None}
+    )
+
+    assert result["reason"] == "Automatic PR delivery was refused."
+
+
+def test_refused_delivery_reason_is_redacted_single_line_and_capped(
+    monkeypatch,
+):
+    secret = "gsk_" + "Z" * 24
+    message = f"failed\n  with key {secret}\n" + "x" * 1000
+    result, detail = _stored_result_after_delivery(
+        monkeypatch, {"status": "refused", "url": None, "message": message}
+    )
+
+    for reason in (result["reason"], detail["reason"]):
+        assert secret not in reason
+        assert "\n" not in reason
+        assert "<REDACTED_GROQ_KEY>" in reason
+        prefix = "Automatic PR delivery was refused: "
+        assert len(reason) <= len(prefix) + 300
