@@ -59,12 +59,15 @@ def _is_environ_access(crash_line: str) -> bool:
 def _mentions_env_var(message: str) -> bool:
     """True when the message says a variable is not set, plus an UPPER_CASE name."""
     lower = message.lower()
-    if not any(
-        kw in lower
-        for kw in ("environment variable", "env var", "is not set")
-    ):
+    explicit = any(kw in lower for kw in ("environment variable", "env var"))
+    if not explicit and "is not set" not in lower:
         return False
-    return bool(re.search(r"\b[A-Z][A-Z0-9_]{1,63}\b", message))
+    names = re.findall(r"\b[A-Z][A-Z0-9_]{1,63}\b", message)
+    if explicit:
+        return bool(names)
+    # A bare "... is not set" is common in ordinary code errors ("Task ID is
+    # not set"), so only a name with an underscore (SHOP_PAYMENT_KEY) counts.
+    return any("_" in name for name in names)
 
 
 def _capacity_keywords(message: str) -> List[str]:
