@@ -89,6 +89,7 @@ def _ack_and_delete(client, stream_name: str, group_name: str, message_id: str):
 def _default_auto_analyzer(incident, limits):
     from aiops.api import main
 
+    classify = os.getenv("AIOPS_CLASSIFIER", "off").lower() == "on"
     try:
         with repository_source(main.REPO_ROOT) as source:
             agent_options = {}
@@ -107,6 +108,7 @@ def _default_auto_analyzer(incident, limits):
                 sandbox=sandbox,
                 limits=limits,
                 signature=incident.signature,
+                classify=classify,
                 **agent_options,
             )
         summary = main.summarize(state)
@@ -187,11 +189,20 @@ def _pipeline_slack_text(incident, summary, pr_url):
         summary.get("baseline_tests_failed"),
     )
     destination = pr_url or "needs a human"
+    classification = summary.get("classification") or {}
+    cls_part = ""
+    if classification:
+        cat = classification.get("category", "")
+        conf = classification.get("confidence", "")
+        action = classification.get("suggested_action", "")
+        cls_part = f"; [{cat}/{conf}]"
+        if action:
+            cls_part += f" {action}"
     text = (
         f"Incident {incident.get('id')} {incident.get('service_name', 'unknown')}; "
         f"{incident.get('error_class', 'unknown error')}; {diff_summary}; "
         f"tests {tests_before[0]}/{tests_before[1]} -> "
-        f"{tests_after[0]}/{tests_after[1]}; {destination}"
+        f"{tests_after[0]}/{tests_after[1]}; {destination}{cls_part}"
     )
     safe_text, _ = redact_text(text)
     return safe_text.replace("@", "@\u200b")[:1000]

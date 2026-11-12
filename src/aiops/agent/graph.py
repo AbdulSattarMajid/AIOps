@@ -1,9 +1,10 @@
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Dict, List, Literal, Tuple, TypedDict
+from typing import Dict, List, Literal, Optional, Tuple, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from aiops.agent.classifier import classify_incident
 from aiops.agent.diff_validator import validate_diff
 from aiops.agent.prompts import SYSTEM_PROMPT, build_user_prompt
 from aiops.context.extract import (
@@ -52,6 +53,7 @@ class IncidentState(TypedDict, total=False):
     test_source: str
     baseline_failed_tests: List[str]
     baseline_test_output: str
+    classification: Optional[Dict]
 
 
 def _related_test_source(state: IncidentState) -> str:
@@ -72,7 +74,8 @@ def _related_test_source(state: IncidentState) -> str:
         return ""
 
 
-def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
+def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None,
+                classify: bool = False):
     def analyze_error(state: IncidentState) -> Dict:
         trace, _ = redact_text(state.get("trace", ""))
         parsed = parse_python_traceback(trace)
@@ -432,6 +435,42 @@ def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
     def after_analyze(state: IncidentState) -> str:
         if state.get("status") == "escalated":
             return "end"
+        if classify:
+            return "classify_incident"
+        return "baseline_tests" if sandbox is not None else "retrieve_runbook"
+
+    def classify_incident_node(state: IncidentState) -> Dict:
+        """Run rule-based classification after analyze_error (classify=True only)."""
+        parsed = parse_python_traceback(state.get("trace", ""))
+        exc = parsed.exception_type or ""
+        msg = parsed.message or ""
+        crash = state.get("crash_line_text", "")
+        result = classify_incident(exc, msg, crash)
+        cls_dict = {
+            "category": result.category,
+            "confidence": result.confidence,
+            "reason": result.reason,
+            "signals": result.signals,
+            "suggested_action": result.suggested_action,
+        }
+        _OPERATIONAL = {"config_issue", "capacity_issue", "dependency_outage"}
+        if result.category in _OPERATIONAL and result.confidence == "high":
+            action = result.suggested_action
+            reason = (
+                f"Not a code bug ({result.category}): {action}"
+                if action
+                else f"Not a code bug ({result.category})."
+            )
+            return {
+                "classification": cls_dict,
+                "status": "escalated",
+                "reason": reason,
+            }
+        return {"classification": cls_dict}
+
+    def after_classify(state: IncidentState) -> str:
+        if state.get("status") == "escalated":
+            return "end"
         return "baseline_tests" if sandbox is not None else "retrieve_runbook"
 
     def after_baseline(state: IncidentState) -> str:
@@ -456,6 +495,8 @@ def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
 
     workflow = StateGraph(IncidentState)
     workflow.add_node("analyze_error", analyze_error)
+    if classify:
+        workflow.add_node("classify_incident", classify_incident_node)
     if sandbox is not None:
         workflow.add_node("baseline_tests", baseline_tests)
     workflow.add_node("retrieve_runbook", retrieve_runbook)
@@ -464,16 +505,36 @@ def build_graph(llm, store, sandbox=None, limits: RedisLimits | None = None):
     if sandbox is not None:
         workflow.add_node("verify_in_sandbox", verify_in_sandbox)
     workflow.add_edge(START, "analyze_error")
-    workflow.add_conditional_edges(
-        "analyze_error", after_analyze,
-        {
-            "end": END,
-            "baseline_tests": "baseline_tests",
-            "retrieve_runbook": "retrieve_runbook",
-        } if sandbox is not None else {
-            "end": END, "retrieve_runbook": "retrieve_runbook",
-        },
-    )
+
+    if classify:
+        # analyze_error -> classify_incident or end (if already escalated)
+        workflow.add_conditional_edges(
+            "analyze_error", after_analyze,
+            {"end": END, "classify_incident": "classify_incident"},
+        )
+        # classify_incident -> end (escalated) or proceed
+        if sandbox is not None:
+            workflow.add_conditional_edges(
+                "classify_incident", after_classify,
+                {"end": END, "baseline_tests": "baseline_tests",
+                 "retrieve_runbook": "retrieve_runbook"},
+            )
+        else:
+            workflow.add_conditional_edges(
+                "classify_incident", after_classify,
+                {"end": END, "retrieve_runbook": "retrieve_runbook"},
+            )
+    else:
+        workflow.add_conditional_edges(
+            "analyze_error", after_analyze,
+            {
+                "end": END,
+                "baseline_tests": "baseline_tests",
+                "retrieve_runbook": "retrieve_runbook",
+            } if sandbox is not None else {
+                "end": END, "retrieve_runbook": "retrieve_runbook",
+            },
+        )
     if sandbox is not None:
         workflow.add_conditional_edges(
             "baseline_tests", after_baseline,
@@ -506,8 +567,8 @@ def run_agent(llm, store, trace: str, service_name: str,
               repo_root: str, incident_id: int = 0,
               path_prefix: str = "/app/", max_retries: int = 3,
               sandbox=None, limits: RedisLimits | None = None,
-              signature: str = "") -> Dict:
-    graph = build_graph(llm, store, sandbox=sandbox, limits=limits)
+              signature: str = "", classify: bool = False) -> Dict:
+    graph = build_graph(llm, store, sandbox=sandbox, limits=limits, classify=classify)
     clean_trace, _ = redact_text(trace or "")
     initial: IncidentState = {
         "incident_id": incident_id,
@@ -567,4 +628,5 @@ def summarize(state: Dict) -> Dict:
             for entry in state.get("history", [])
         ],
         "verification": verification,
+        "classification": state.get("classification", None),
     }
