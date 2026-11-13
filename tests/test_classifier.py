@@ -447,3 +447,38 @@ def test_aiops_classifier_default_is_off(monkeypatch) -> None:
 def test_aiops_classifier_on_enables_classify(monkeypatch) -> None:
     monkeypatch.setenv("AIOPS_CLASSIFIER", "on")
     assert os.getenv("AIOPS_CLASSIFIER", "off").lower() == "on"
+
+
+def test_generic_is_not_set_message_is_not_a_config_issue():
+    from aiops.agent.classifier import classify_incident
+
+    value_error = classify_incident(
+        "ValueError", "Task ID is not set", "raise ValueError('Task ID is not set')"
+    )
+    assertion = classify_incident(
+        "AssertionError", "HTTP status is not set", "assert status"
+    )
+
+    assert value_error.category == "code_bug"
+    assert assertion.category == "code_bug"
+
+
+def test_env_var_name_with_underscore_is_still_a_config_issue():
+    from aiops.agent.classifier import classify_incident
+
+    result = classify_incident(
+        "RuntimeError", "SHOP_PAYMENT_KEY is not set", "check_key()"
+    )
+
+    assert result.category == "config_issue"
+    assert "SHOP_PAYMENT_KEY" in result.suggested_action
+
+
+def test_explicit_environment_variable_wording_is_still_a_config_issue():
+    from aiops.agent.classifier import classify_incident
+
+    result = classify_incident(
+        "RuntimeError", "Missing environment variable PORT", "start()"
+    )
+
+    assert result.category == "config_issue"
