@@ -12,9 +12,8 @@ import uuid
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy import inspect as sa_inspect
 
-from aiops.db.models import Analysis, Base, Delivery, FixAttempt, Incident
+from aiops.db.models import Base
 from aiops.db.session import get_engine, get_session_factory, _coerce_url
 
 
@@ -188,7 +187,7 @@ class TestLiveDatabase:
         # Create tables in the throwaway schema using set_schema on a copy of metadata.
         schema_meta = sa.MetaData(schema=schema)
         for table in Base.metadata.sorted_tables:
-            table.tometadata(schema_meta)
+            table.to_metadata(schema_meta)
         schema_meta.create_all(bind=engine)
 
         yield engine, schema

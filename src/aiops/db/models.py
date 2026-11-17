@@ -9,10 +9,9 @@ Four tables:
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import (
-    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -42,7 +41,7 @@ class Incident(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    signature: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    signature: Mapped[str] = mapped_column(Text, nullable=False)
     service_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_class: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     redacted_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -85,7 +84,7 @@ class Analysis(Base):
     confidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    signals: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    signals: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
     classifier_on: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
