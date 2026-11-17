@@ -15,10 +15,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, func
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -35,7 +37,37 @@ _MAX_DIFF = 20000
 _MAX_SIGNALS = 20
 _CONNECT_TIMEOUT_SECONDS = 3
 
+# After a connection or missing-table failure, stop trying for a while so a
+# database outage cannot slow the worker down on every single crash.
+_PAUSE_AFTER_FAILURE_SECONDS = 30
+
 _ENGINES: Dict[str, Engine] = {}
+_paused_until = 0.0
+
+
+def _reset_pause() -> None:
+    """Forget a previous failure (used by tests)."""
+    global _paused_until
+    _paused_until = 0.0
+
+
+def _is_paused() -> bool:
+    return time.monotonic() < _paused_until
+
+
+def _pause() -> None:
+    global _paused_until
+    _paused_until = time.monotonic() + _PAUSE_AFTER_FAILURE_SECONDS
+
+
+def _should_pause(error: Exception) -> bool:
+    """Pause for outages and missing tables, not for a one-off bad value."""
+    if isinstance(error, (OperationalError, InterfaceError)):
+        return True
+    original = getattr(error, "orig", None)
+    return isinstance(error, DBAPIError) and (
+        type(original).__name__ == "UndefinedTable"
+    )
 
 
 def _default_engine() -> Optional[Engine]:
@@ -166,17 +198,8 @@ def _attempt_rows(
     return rows
 
 
-def _write(
-    session: Session,
-    incident: Any,
-    summary: Dict,
-    status: str,
-    reason: str,
-    delivery: Optional[Dict],
-    slack_sent: Optional[bool],
-    analysis_history: Optional[List[Dict]],
-    classifier_on: Optional[bool],
-) -> None:
+def _upsert_incident(session: Session, incident: Any, summary: Dict) -> int:
+    """Insert the incident, or update the existing row with the same signature."""
     error_class = _clean(_get(incident, "error_class", ""), 300) or ""
     message = _clean(
         _message_from_trace(error_class, _get(incident, "sample_trace", "") or ""),
@@ -199,7 +222,7 @@ def _write(
         last_seen=last_seen,
     )
     table = Incident.__table__
-    incident_id = session.execute(
+    return session.execute(
         insert.on_conflict_do_update(
             constraint="uq_incidents_signature",
             set_={
@@ -220,6 +243,20 @@ def _write(
             },
         ).returning(table.c.id)
     ).scalar_one()
+
+
+def _write(
+    session: Session,
+    incident: Any,
+    summary: Dict,
+    status: str,
+    reason: str,
+    delivery: Optional[Dict],
+    slack_sent: Optional[bool],
+    analysis_history: Optional[List[Dict]],
+    classifier_on: Optional[bool],
+) -> None:
+    incident_id = _upsert_incident(session, incident, summary)
 
     classification = summary.get("classification")
     analysis = Analysis(
@@ -252,6 +289,48 @@ def _write(
         ))
 
 
+def _run_in_transaction(work, engine: Optional[Engine]) -> bool:
+    """Run *work(session)* in one transaction.  Never raises."""
+    try:
+        if _is_paused():
+            return False
+        if engine is None:
+            engine = _default_engine()
+        if engine is None:
+            return False
+        with Session(engine) as session:
+            with session.begin():
+                work(session)
+        return True
+    except Exception as error:  # noqa: BLE001 - history must never stop the pipeline
+        original = getattr(error, "orig", None)
+        if type(original).__name__ == "UndefinedTable":
+            logger.warning(
+                "Postgres history not saved: tables are missing. "
+                "Run 'alembic upgrade head'."
+            )
+        else:
+            logger.warning(
+                "Postgres history not saved (%s).", type(error).__name__
+            )
+        if _should_pause(error):
+            _pause()
+        return False
+
+
+def save_incident_seen(
+    incident: Any, *, engine: Optional[Engine] = None
+) -> bool:
+    """Record that an incident exists (and its latest count and time).
+
+    Used for every crash event, so repeats raise the count even when no new
+    analysis is run.  Never raises.
+    """
+    return _run_in_transaction(
+        lambda session: _upsert_incident(session, incident, {}), engine
+    )
+
+
 def save_incident_history(
     incident: Any,
     summary: Optional[Dict],
@@ -270,28 +349,11 @@ def save_incident_history(
     *summary* is the dict from ``summarize()`` (may be None or empty).
     Pass *engine* only in tests; normally it comes from ``DATABASE_URL``.
     """
-    try:
-        if engine is None:
-            engine = _default_engine()
-        if engine is None:
-            return False
-        with Session(engine) as session:
-            with session.begin():
-                _write(
-                    session, incident, summary or {}, str(status or ""),
-                    reason or "", delivery, slack_sent, analysis_history,
-                    classifier_on,
-                )
-        return True
-    except Exception as error:  # noqa: BLE001 - history must never stop the pipeline
-        original = getattr(error, "orig", None)
-        if type(original).__name__ == "UndefinedTable":
-            logger.warning(
-                "Postgres history not saved: tables are missing. "
-                "Run 'alembic upgrade head'."
-            )
-        else:
-            logger.warning(
-                "Postgres history not saved (%s).", type(error).__name__
-            )
-        return False
+    return _run_in_transaction(
+        lambda session: _write(
+            session, incident, summary or {}, str(status or ""),
+            reason or "", delivery, slack_sent, analysis_history,
+            classifier_on,
+        ),
+        engine,
+    )
