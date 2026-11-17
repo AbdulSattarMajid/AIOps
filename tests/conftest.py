@@ -63,7 +63,9 @@ def clear_developer_settings(monkeypatch):
 
 
 # These modules manage their own database engine inside a throwaway schema.
-DATABASE_TEST_MODULES = {"test_db_models", "test_db_history", "test_db_worker"}
+DATABASE_TEST_MODULES = {
+    "test_db_models", "test_db_history", "test_db_worker", "test_db_outcomes",
+}
 
 
 @pytest.fixture(autouse=True)
