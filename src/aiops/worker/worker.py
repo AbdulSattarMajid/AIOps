@@ -224,6 +224,39 @@ def _record_auto_result(processor, incident, status, reason):
         pass
 
 
+def _history_incident_seen(incident):
+    """Record the crash in Postgres history.  Never raises."""
+    try:
+        from aiops.db.history import save_incident_seen
+
+        save_incident_seen(incident)
+    except Exception:
+        pass
+
+
+def _history_analysis(
+    incident, result, status, reason, delivery, slack_sent, analysis_history
+):
+    """Save the analysis result in Postgres history.  Never raises."""
+    try:
+        from aiops.db.history import save_incident_history
+
+        save_incident_history(
+            incident,
+            result,
+            status=status,
+            reason=reason,
+            delivery=delivery or None,
+            slack_sent=slack_sent,
+            analysis_history=analysis_history,
+            classifier_on=(
+                os.getenv("AIOPS_CLASSIFIER", "off").lower() == "on"
+            ),
+        )
+    except Exception:
+        pass
+
+
 def _maybe_auto_analyze(
     processor,
     incident,
@@ -338,6 +371,7 @@ def _maybe_auto_analyze(
         )
         _record_auto_result(processor, incident, status, reason)
         webhook = os.getenv("SLACK_WEBHOOK_URL", "")
+        slack_sent = None
         if webhook:
             pr_url = (
                 delivery.get("pr_url") or delivery.get("url")
@@ -349,16 +383,25 @@ def _maybe_auto_analyze(
 
                 if slack_sender is not None:
                     slack_sender(message)
+                    slack_sent = True
                 elif not post_slack(webhook, message, raise_errors=True):
+                    slack_sent = False
                     _record_auto_result(
                         processor, incident, status,
                         "Slack notification failed; inspect service health.",
                     )
+                else:
+                    slack_sent = True
             except Exception:
+                slack_sent = False
                 _record_auto_result(
                     processor, incident, status,
                     "Slack notification failed; inspect service health.",
                 )
+        _history_analysis(
+            incident, result, status, reason, delivery, slack_sent,
+            analysis_history,
+        )
     except Exception:
         _record_auto_result(
             processor, incident, "escalated",
@@ -441,6 +484,7 @@ def drain_once(
             incident, is_new = processor.process(event, event_id=message_id)
         except Exception:
             continue
+        _history_incident_seen(incident)
         if is_new:
             _maybe_auto_analyze(
                 processor,
@@ -456,6 +500,14 @@ def drain_once(
 
 
 def run_worker() -> None:
+    # Pick up DATABASE_URL and the other settings from .env.  Values that are
+    # already set in the shell are kept (override=False).
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except Exception:
+        pass
     client = get_redis()
     consumer = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex}"
     engine = DedupEngine(store=RedisStore(client=client))

@@ -62,6 +62,21 @@ def clear_developer_settings(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+# These modules manage their own database engine inside a throwaway schema.
+DATABASE_TEST_MODULES = {"test_db_models", "test_db_history", "test_db_worker"}
+
+
+@pytest.fixture(autouse=True)
+def never_touch_the_real_database(request, monkeypatch):
+    """No test may write to a developer's real Postgres.
+
+    The worker saves history whenever DATABASE_URL is set, so every test
+    outside the database test modules runs without it.
+    """
+    if request.module.__name__.split(".")[-1] not in DATABASE_TEST_MODULES:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+
+
 @pytest.fixture(autouse=True)
 def reset_redis(monkeypatch, clear_developer_settings):
     client = fakeredis.FakeRedis(decode_responses=True)

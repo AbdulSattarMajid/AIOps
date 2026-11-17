@@ -81,6 +81,13 @@ def _verified_summary(**overrides) -> dict:
     return summary
 
 
+@pytest.fixture(autouse=True)
+def _fresh_pause():
+    history._reset_pause()
+    yield
+    history._reset_pause()
+
+
 # ---------------------------------------------------------------------------
 # No database needed
 # ---------------------------------------------------------------------------
@@ -126,6 +133,45 @@ class TestWithoutDatabase:
             "KeyError: 'a'"
         )
         assert history._message_from_trace("KeyError", "") == "KeyError"
+
+    def test_after_an_outage_it_pauses_instead_of_retrying_every_time(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@127.0.0.1:1/x")
+        history._ENGINES.clear()
+        attempts = []
+        real_default = history._default_engine
+
+        def counting_default():
+            attempts.append(1)
+            return real_default()
+
+        monkeypatch.setattr(history, "_default_engine", counting_default)
+        assert history.save_incident_seen(_incident()) is False
+        assert len(attempts) == 1
+        # The next calls are skipped at once, without touching the database.
+        assert history.save_incident_seen(_incident()) is False
+        assert save_incident_history(
+            _incident(), _verified_summary(), status="verified"
+        ) is False
+        assert len(attempts) == 1
+        history._ENGINES.clear()
+
+    def test_the_pause_ends_after_the_waiting_time(self, monkeypatch) -> None:
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(history.time, "monotonic", lambda: clock["now"])
+        history._pause()
+        assert history._is_paused() is True
+        clock["now"] += history._PAUSE_AFTER_FAILURE_SECONDS + 1
+        assert history._is_paused() is False
+
+    def test_a_bad_value_does_not_pause_everything(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            history, "_default_engine",
+            lambda: (_ for _ in ()).throw(ValueError("one odd record")),
+        )
+        assert history.save_incident_seen(_incident()) is False
+        assert history._is_paused() is False
 
     def test_default_engine_is_cached_and_does_not_connect(
         self, monkeypatch
@@ -234,6 +280,37 @@ class TestWithPostgres:
         assert row["first_seen"] == datetime(2026, 11, 17, 7, 0, tzinfo=timezone.utc)
         # An empty crash location in the second save must not erase the first.
         assert row["crash_function"] == "get_task"
+
+    def test_incident_seen_creates_and_updates_one_row(self, pg) -> None:
+        assert history.save_incident_seen(_incident(count=1), engine=pg) is True
+        assert history.save_incident_seen(
+            _incident(count=4, last_seen="2026-11-17T08:00:00+00:00"),
+            engine=pg,
+        ) is True
+        assert self._count(pg, "incidents") == 1
+        assert self._count(pg, "analyses") == 0
+        row = self._rows(pg, "SELECT * FROM incidents")[0]
+        assert row["occurrences"] == 4
+        assert row["last_seen"] == datetime(
+            2026, 11, 17, 8, 0, tzinfo=timezone.utc)
+
+    def test_missing_tables_pause_further_attempts(self, caplog) -> None:
+        base = _live_engine()
+        schema = f"test_{uuid.uuid4().hex}"
+        with base.begin() as conn:
+            conn.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+        engine = sa.create_engine(
+            _coerce_url(os.environ["DATABASE_URL"]),
+            connect_args={"options": f"-c search_path={schema}"},
+        )
+        try:
+            assert history.save_incident_seen(_incident(), engine=engine) is False
+            assert history._is_paused() is True
+        finally:
+            engine.dispose()
+            with base.begin() as conn:
+                conn.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+            base.dispose()
 
     def test_a_smaller_count_never_lowers_the_stored_count(self, pg) -> None:
         save_incident_history(
