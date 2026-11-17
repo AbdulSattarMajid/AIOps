@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse
 
 from aiops.agent.fake_llm import make_demo_llm
 from aiops.agent.graph import run_agent, summarize
 from aiops.agent.llm import GroqLLM, MissingAPIKeyError, MissingModelError
 from aiops.context.github_source import GitHubSourceError, repository_source
+from aiops.db.outcomes import (
+    DeliveryNotFound,
+    HistoryUnavailable,
+    record_outcome,
+)
 from aiops.dedup.engine import DedupEngine
 from aiops.delivery.github_pr import DeliveryError, PyGithubClient, deliver
 from aiops.delivery.slack import build_slack_text, post_slack
@@ -352,6 +358,30 @@ def get_queue_stats():
             detail=str(error),
             headers={"Retry-After": "5"},
         ) from error
+
+
+class OutcomeUpdate(BaseModel):
+    pr_url: str = Field(min_length=1, max_length=1000)
+    outcome: Literal["open", "merged", "closed", "ignored"]
+
+
+@app.post("/api/v1/history/outcome")
+def set_delivery_outcome(update: OutcomeUpdate):
+    """Write down what a human decided about a draft PR.
+
+    This only records the decision in the history database.  It never merges
+    or closes anything on GitHub.
+    """
+    try:
+        return record_outcome(update.pr_url, update.outcome)
+    except DeliveryNotFound:
+        raise HTTPException(
+            status_code=404, detail="No saved delivery has that PR link."
+        ) from None
+    except HistoryUnavailable:
+        raise HTTPException(
+            status_code=503, detail="The history database is not available."
+        ) from None
 
 
 @app.get("/api/v1/incidents")
